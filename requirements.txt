@@ -50,7 +50,6 @@ stack-data==0.6.3
 threadpoolctl==3.5.0
 tokenizers==0.20.3
 torch==1.13.1
-torch-geometric
 torchaudio==0.13.1
 torchvision==0.14.1
 tornado==6.4.2
