@@ -4,9 +4,6 @@ node_modules/
 *.log
 # 忽略 dist 目录
 dist/
-data/*
+data/
 result/
 __pycache__/
-
-plm/chinese-roberta-wwm-ext/pytorch_model.bin
-plm/chinese-roberta-wwm-ext/tf_model.h5
