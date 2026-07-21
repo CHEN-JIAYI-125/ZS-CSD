@@ -17,3 +17,9 @@ gradient_accumulation_steps: 1
 adam_epsilon: 1e-8
 warmup_steps: 0
 
+# topology — dual-channel context / speaker-history
+use_topology: 1
+speaker_history_k: 3
+edge_time_decay: 0.2
+topology_dropout: 0.1
+alpha: 0
