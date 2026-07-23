@@ -25,3 +25,10 @@ topology_dropout: 0.2
 topology_gate_init: -2.0
 label_smoothing: 0.05
 alpha: 0
+
+# speaker hypergraph (v2)
+use_speaker_hypergraph: 1
+speaker_hypergraph_k: 4
+speaker_hypergraph_min_size: 2
+hypergraph_dropout: 0.2
+hypergraph_gate_init: -3.0
