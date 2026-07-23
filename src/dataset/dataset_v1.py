@@ -47,6 +47,16 @@ CONTEXT_EDGE_TYPES = {
     EDGE_QUESTION_REPLY,
 }
 
+EDGE_TYPE_WEIGHTS = {
+    EDGE_NEXT_TURN: 0.5,
+    EDGE_REPLY: 1.0,
+    EDGE_AGREE_REPLY: 1.2,
+    EDGE_QUESTION_REPLY: 0.6,
+    EDGE_CHALLENGE_REPLY: 0.3,
+    EDGE_SAME_SPEAKER: 1.0,
+    EDGE_SELF: 1.0,
+}
+
 class MyDataset(Dataset):
     def __init__(self, data):
         self.data = data
@@ -190,12 +200,15 @@ class DataProcessor():
             return EDGE_GROUP_CONTEXT
         return EDGE_GROUP_AUXILIARY
 
+    def edge_type_weight(self, edge_type):
+        return EDGE_TYPE_WEIGHTS.get(edge_type, 1.0)
+
     def build_topology_graph(self, speakers, reply_relations, reply_parents, reply_confidences=None, local_window=3):
         """Build utterance graph with edge_group for dual-channel propagation."""
         speaker_ids = [int(speaker) for speaker in speakers]
         num_turns = len(speaker_ids)
-        speaker_history_k = int(getattr(self.config, 'speaker_history_k', 3))
-        edge_time_decay = float(getattr(self.config, 'edge_time_decay', 0.2))
+        speaker_history_k = int(getattr(self.config, 'speaker_history_k', 1))
+        edge_time_decay = float(getattr(self.config, 'edge_time_decay', 0.3))
 
         edge_src = []
         edge_dst = []
@@ -212,6 +225,7 @@ class DataProcessor():
         def add_edge(src, dst, edge_type, edge_group, weight=1.0):
             if not (0 <= src < num_turns and 0 <= dst < num_turns):
                 return
+            weight = float(weight) * self.edge_type_weight(edge_type)
             if src != dst:
                 pair = (src, dst)
                 if pair in added_pairs:
@@ -221,7 +235,7 @@ class DataProcessor():
             edge_dst.append(dst)
             edge_types.append(edge_type)
             edge_groups.append(edge_group)
-            edge_weights.append(float(weight))
+            edge_weights.append(weight)
 
         for turn_id, speaker in enumerate(speaker_ids):
             add_edge(turn_id, turn_id, EDGE_SELF, EDGE_GROUP_AUXILIARY, 1.0)
@@ -266,6 +280,8 @@ class DataProcessor():
                     decay_weight(prev_turn, turn_id),
                 )
             history_by_speaker.setdefault(speaker, []).append(turn_id)
+
+        assert len(edge_types) == len(edge_groups) == len(edge_weights), 'edge metadata length mismatch'
 
         graph_values = {
             'num_utterance_nodes': num_turns,

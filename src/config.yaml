@@ -19,7 +19,9 @@ warmup_steps: 0
 
 # topology — dual-channel context / speaker-history
 use_topology: 1
-speaker_history_k: 3
-edge_time_decay: 0.2
-topology_dropout: 0.1
+speaker_history_k: 1
+edge_time_decay: 0.3
+topology_dropout: 0.2
+topology_gate_init: -2.0
+label_smoothing: 0.05
 alpha: 0

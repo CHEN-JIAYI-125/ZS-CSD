@@ -342,6 +342,25 @@ EDGE_GROUP_SPEAKER_HISTORY = 1
 EDGE_GROUP_AUXILIARY = 2
 
 
+def summarize_edge_groups(graph):
+    """Return edge counts per group; use for debugging graph construction."""
+    edge_group = _graph_tensor(graph, 'edge_group')
+    if edge_group is None:
+        return {
+            'context': 0,
+            'speaker': 0,
+            'auxiliary': 0,
+            'missing_edge_group': True,
+        }
+    counts = torch.bincount(edge_group.long().view(-1), minlength=3)
+    return {
+        'context': int(counts[0].item()),
+        'speaker': int(counts[1].item()),
+        'auxiliary': int(counts[2].item()),
+        'missing_edge_group': False,
+    }
+
+
 def build_group_adjacency(graph, num_nodes, group_id, device, dtype):
     """Row-normalized weighted adjacency for one edge group (src -> dst)."""
     adj = torch.zeros(num_nodes, num_nodes, device=device, dtype=dtype)
@@ -350,12 +369,14 @@ def build_group_adjacency(graph, num_nodes, group_id, device, dtype):
     edge_weight = _graph_tensor(graph, 'edge_weight')
     if edge_index is None or edge_index.numel() == 0:
         return adj
+    if edge_group is None:
+        raise ValueError('topology graph is missing edge_group; rebuild with dataset_v1')
 
     if edge_index.device != device:
         edge_index = edge_index.to(device)
     src = edge_index[0].long()
     dst = edge_index[1].long()
-    groups = edge_group.long().to(device) if edge_group is not None else torch.zeros(src.size(0), device=device, dtype=torch.long)
+    groups = edge_group.long().to(device)
     weights = edge_weight.to(device=device, dtype=dtype) if edge_weight is not None else torch.ones(src.size(0), device=device, dtype=dtype)
 
     for i in range(src.size(0)):
@@ -374,21 +395,25 @@ def build_group_adjacency(graph, num_nodes, group_id, device, dtype):
 
 class TwoChannelTopologyEncoder(nn.Module):
     """
-    Separate context and speaker-history message passing with learnable fusion.
+    Dual-channel propagation with independent sigmoid gates.
 
-    H' = LayerNorm(H + alpha_c * A_context @ H @ W_c + alpha_s * A_speaker @ H @ W_s)
+    Gates init at sigmoid(-2) ~ 0.12 so the model starts close to SSE-only.
     """
 
-    def __init__(self, hidden_dim, dropout=0.1):
+    def __init__(self, hidden_dim, dropout=0.2, gate_init=-2.0):
         super().__init__()
-        self.context_linear = nn.Linear(hidden_dim, hidden_dim)
-        self.speaker_linear = nn.Linear(hidden_dim, hidden_dim)
-        self.edge_group_logits = nn.Parameter(torch.zeros(2))
+        self.context_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.speaker_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.context_gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+        self.speaker_gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+        self.message_dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
 
     def channel_weights(self):
-        return 2.0 * F.softmax(self.edge_group_logits, dim=0)
+        return torch.stack([
+            torch.sigmoid(self.context_gate_logit),
+            torch.sigmoid(self.speaker_gate_logit),
+        ])
 
     def forward(self, nodes, graph):
         num_nodes = nodes.size(0)
@@ -398,10 +423,12 @@ class TwoChannelTopologyEncoder(nn.Module):
         adj_context = build_group_adjacency(graph, num_nodes, EDGE_GROUP_CONTEXT, device, dtype)
         adj_speaker = build_group_adjacency(graph, num_nodes, EDGE_GROUP_SPEAKER_HISTORY, device, dtype)
 
-        context_message = torch.matmul(adj_context, self.context_linear(nodes))
-        speaker_message = torch.matmul(adj_speaker, self.speaker_linear(nodes))
+        context_message = F.gelu(torch.matmul(adj_context, self.context_linear(nodes)))
+        speaker_message = F.gelu(torch.matmul(adj_speaker, self.speaker_linear(nodes)))
 
-        alpha = self.channel_weights()
-        output = nodes + alpha[0] * context_message + alpha[1] * speaker_message
-        output = self.dropout(output)
+        context_message = self.message_dropout(context_message)
+        speaker_message = self.message_dropout(speaker_message)
+
+        gates = self.channel_weights()
+        output = nodes + gates[0] * context_message + gates[1] * speaker_message
         return self.norm(output)

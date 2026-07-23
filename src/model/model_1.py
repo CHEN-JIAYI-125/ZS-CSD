@@ -65,15 +65,41 @@ class SITCL(nn.Module):
         self.config = config
         self.alpha = config.alpha
         self.use_topology = bool(getattr(config, 'use_topology', 1))
+        self.last_topology_gates = None
         self.bert = AutoModel.from_pretrained(config.bert_dir)
         self.gru = nn.GRU(input_size=768, hidden_size=config.gru_hidden, num_layers=config.gru_layer, batch_first=True)
         self.fc = nn.Linear(config.gru_hidden, config.num_classes)
-        self.criterion = nn.CrossEntropyLoss()
+
+        label_smoothing = float(getattr(config, 'label_smoothing', 0.05))
+        class_weight = self._build_class_weights(config)
+        self.criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=label_smoothing)
+
         self.SSE = SSE(hidden_dim=config.gru_hidden)
         if self.use_topology:
-            dropout = float(getattr(config, 'topology_dropout', 0.1))
-            self.topology_encoder = TwoChannelTopologyEncoder(config.gru_hidden, dropout=dropout)
+            dropout = float(getattr(config, 'topology_dropout', 0.2))
+            gate_init = float(getattr(config, 'topology_gate_init', -2.0))
+            self.topology_encoder = TwoChannelTopologyEncoder(
+                config.gru_hidden,
+                dropout=dropout,
+                gate_init=gate_init,
+            )
             self.fusion_gate = nn.Linear(config.gru_hidden * 2, config.gru_hidden)
+
+    def _build_class_weights(self, config):
+        if not bool(getattr(config, 'use_class_weight', 0)):
+            return None
+        counts = getattr(config, 'class_counts', None)
+        if not counts:
+            return None
+        weights = 1.0 / torch.sqrt(torch.tensor(counts, dtype=torch.float))
+        weights = weights / weights.mean()
+        return weights.to(config.device)
+
+    def get_topology_gates(self):
+        if not self.use_topology or self.topology_encoder is None:
+            return None
+        with torch.no_grad():
+            return self.topology_encoder.channel_weights().detach().cpu().tolist()
 
     def _extract_utterance_hidden(self, out, st, ed, mask_positions, dia_id):
         if mask_positions is not None:
@@ -113,6 +139,9 @@ class SITCL(nn.Module):
 
             H_final.append(v)
             stance.append(final_state)
+
+        if self.use_topology and self.topology_encoder is not None:
+            self.last_topology_gates = self.get_topology_gates()
 
         stance = torch.stack(stance)
         logits = self.fc(stance)
