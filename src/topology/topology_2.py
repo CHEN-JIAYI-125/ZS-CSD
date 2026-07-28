@@ -3,10 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from torch_geometric.nn import RGCNConv, HypergraphConv
+    from torch_geometric.nn import RGCNConv
 except ImportError:
     RGCNConv = None
-    HypergraphConv = None
 
 
 EDGE_SELF = 0
@@ -436,53 +435,84 @@ class TwoChannelTopologyEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Speaker hypergraph encoder (v2): high-order speaker trajectory aggregation
+# Target-aware speaker hyperedge readout (v2)
 # ---------------------------------------------------------------------------
 
-class SpeakerHypergraphEncoder(nn.Module):
+class TargetAwareSpeakerHypergraph(nn.Module):
     """
-    Speaker-level hypergraph propagation on top of ordinary-graph features.
+    Speaker hyperedge readout for the final utterance only.
 
-    Applied after TwoChannelTopologyEncoder; uses a small residual gate (~0.05 at init).
+    - Pool each speaker's history with target-conditioned attention + time decay.
+    - Exclude the target utterance from history pooling.
+    - Let the target attend over all speaker hyperedge representations.
+    - gate=0 is an exact identity on the target node (no extra LayerNorm on full graph).
     """
 
-    def __init__(self, hidden_dim, dropout=0.2, gate_init=-3.0):
+    def __init__(self, hidden_dim, dropout=0.3, gate_init=-4.0):
         super().__init__()
-        if HypergraphConv is None:
-            raise ImportError('SpeakerHypergraphEncoder requires torch_geometric.nn.HypergraphConv')
-        self.conv = HypergraphConv(
-            in_channels=hidden_dim,
-            out_channels=hidden_dim,
-            use_attention=False,
-            bias=False,
-        )
+        self.node_query = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.node_key = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.node_value = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.edge_query = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.edge_key = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.edge_value = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.time_decay = nn.Parameter(torch.tensor(-1.0))
         self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
-        self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = hidden_dim ** -0.5
 
     def gate_weight(self):
         return torch.sigmoid(self.gate_logit)
 
     def forward(self, nodes, graph):
+        target_id = nodes.size(0) - 1
+        target = nodes[target_id]
+
         hyperedge_index = _graph_tensor(graph, 'speaker_hyperedge_index')
         if hyperedge_index is None or hyperedge_index.numel() == 0:
             return nodes
 
         hyperedge_index = hyperedge_index.to(nodes.device)
-        hyperedge_weight = _graph_tensor(graph, 'speaker_hyperedge_weight')
+        node_ids = hyperedge_index[0].long()
+        edge_ids = hyperedge_index[1].long()
         num_hyperedges = _graph_scalar(graph, 'num_speaker_hyperedges', 0)
 
-        if hyperedge_weight is not None:
-            hyperedge_weight = hyperedge_weight.to(device=nodes.device, dtype=nodes.dtype)
+        edge_reprs = []
+        gamma = F.softplus(self.time_decay)
+        q_node = self.node_query(target)
 
-        hyper_message = self.conv(
-            nodes,
-            hyperedge_index,
-            hyperedge_weight=hyperedge_weight,
-            num_edges=num_hyperedges,
-        )
-        hyper_message = F.gelu(hyper_message)
-        hyper_message = self.dropout(hyper_message)
+        for edge_id in range(num_hyperedges):
+            members = node_ids[edge_ids == edge_id]
+            members = members[members != target_id]
+            if members.numel() == 0:
+                continue
 
+            history = nodes[members]
+            scores = (q_node * self.node_key(history)).sum(dim=-1) * self.scale
+            distance = (target_id - members).to(dtype=nodes.dtype, device=nodes.device)
+            scores = scores - gamma * distance
+            weights = torch.softmax(scores, dim=0)
+            edge_repr = (weights.unsqueeze(-1) * self.node_value(history)).sum(dim=0)
+            edge_reprs.append(edge_repr)
+
+        if not edge_reprs:
+            return nodes
+
+        edge_reprs = torch.stack(edge_reprs)
+        edge_scores = (self.edge_query(target) * self.edge_key(edge_reprs)).sum(dim=-1) * self.scale
+        edge_weights = torch.softmax(edge_scores, dim=0)
+        hyper_context = (edge_weights.unsqueeze(-1) * self.edge_value(edge_reprs)).sum(dim=0)
+        hyper_context = self.dropout(hyper_context)
+
+        candidate = self.norm(target + hyper_context)
         gate = self.gate_weight()
-        return self.norm(nodes + gate * hyper_message)
+        target_out = target + gate * (candidate - target)
+
+        output = nodes.clone()
+        output[target_id] = target_out
+        return output
+
+
+# Backward-compatible alias
+SpeakerHypergraphEncoder = TargetAwareSpeakerHypergraph

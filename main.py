@@ -19,7 +19,8 @@ class Main:
     def __init__(self, args):
         config = Box(yaml.load(open('src/config.yaml', 'r', encoding='utf-8'), Loader=yaml.FullLoader))
         for k, v in vars(args).items():
-            setattr(config, k, v)
+            if v is not None:
+                setattr(config, k, v)
         self.config = config
         self.formatted_time = config.time
         self.log_dir = f"./result/{self.config.model_type}_{self.formatted_time}/log/"
@@ -100,11 +101,19 @@ class Main:
         no_decay = ['bias', 'LayerNorm.weight']
         bert_lr = float(self.config.bert_lr)
         other_lr = float(self.config.other_lr)
+        hyper_lr = float(getattr(self.config, 'hypergraph_lr', 2e-6))
+        wd = float(self.config.weight_decay)
+
+        def is_hyper(name):
+            return 'hypergraph' in name
+
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in param_optimizer if 'bert' in n and not any(nd in n for nd in no_decay)], 'weight_decay': float(self.config.weight_decay), 'lr': bert_lr},
+            {'params': [p for n, p in param_optimizer if 'bert' in n and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': bert_lr},
             {'params': [p for n, p in param_optimizer if 'bert' in n and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': bert_lr},
-            {'params': [p for n, p in param_optimizer if 'bert' not in n and not any(nd in n for nd in no_decay)], 'weight_decay': float(self.config.weight_decay), 'lr': other_lr},
-            {'params': [p for n, p in param_optimizer if 'bert' not in n and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': other_lr}
+            {'params': [p for n, p in param_optimizer if 'bert' not in n and is_hyper(n) and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': hyper_lr},
+            {'params': [p for n, p in param_optimizer if 'bert' not in n and is_hyper(n) and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': hyper_lr},
+            {'params': [p for n, p in param_optimizer if 'bert' not in n and not is_hyper(n) and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': other_lr},
+            {'params': [p for n, p in param_optimizer if 'bert' not in n and not is_hyper(n) and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': other_lr},
         ]
         self.optimizer = AdamW(optimizer_grouped_parameters, eps=float(self.config.adam_epsilon))
         self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=self.config.warmup_steps,
@@ -123,6 +132,16 @@ class Main:
     def forward(self):
         self.trainLoader, self.devLoader, self.testLoader = DataProcessor(self.config).get_data()
         self.model = SITCL(self.config).to(self.config.device)
+        init_checkpoint = getattr(self.config, 'init_checkpoint', None)
+        if init_checkpoint:
+            state_dict = torch.load(init_checkpoint, map_location=self.config.device)
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+            logging.info(
+                'Loaded init checkpoint from %s (missing=%d, unexpected=%d)',
+                init_checkpoint,
+                len(missing),
+                len(unexpected),
+            )
         self.load_param()
         logging.info('Start training...')
         self.train()
@@ -132,10 +151,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--bert_lr', type=float, default=1e-5)
     parser.add_argument('--other_lr', type=float, default=1e-5)
-    parser.add_argument('--weight_decay', type=float, default=1e-6)
+    parser.add_argument('--weight_decay', type=float, default=None)
     parser.add_argument('--hidden_size', type=int, default=768)
     parser.add_argument('--num_classes', type=int, default=3)
-    parser.add_argument('--alpha', type=float, default=1)
+    parser.add_argument('--alpha', type=float, default=None)
     parser.add_argument('--tau', type=float, default=0.1)
     parser.add_argument('--cuda_index', type=int, default=0)
     parser.add_argument('--seed', type=int, default=1234)
@@ -146,6 +165,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_type', type=str, default='SITPCL')
     parser.add_argument('--plm', type=str, default='roberta')
     parser.add_argument('--bert_dir', type=str, default='./plm/chinese-roberta-wwm-ext/')
+    parser.add_argument('--init_checkpoint', type=str, default=None)
     args = parser.parse_args()
     main = Main(args)
     main.forward()

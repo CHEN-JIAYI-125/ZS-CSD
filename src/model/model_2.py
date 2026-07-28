@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModel
 import torch.nn.functional as F
 from src.common import map_sequence, target_CL
-from src.topology.topology_2 import TwoChannelTopologyEncoder, SpeakerHypergraphEncoder
+from src.topology.topology_2 import TwoChannelTopologyEncoder, TargetAwareSpeakerHypergraph
 
 
 class Attention(nn.Module):
@@ -86,9 +86,9 @@ class SITCL(nn.Module):
                 gate_init=gate_init,
             )
             if self.use_hypergraph:
-                hyper_dropout = float(getattr(config, 'hypergraph_dropout', 0.2))
-                hyper_gate_init = float(getattr(config, 'hypergraph_gate_init', -3.0))
-                self.hypergraph_encoder = SpeakerHypergraphEncoder(
+                hyper_dropout = float(getattr(config, 'hypergraph_dropout', 0.3))
+                hyper_gate_init = float(getattr(config, 'hypergraph_gate_init', -4.0))
+                self.hypergraph_encoder = TargetAwareSpeakerHypergraph(
                     config.gru_hidden,
                     dropout=hyper_dropout,
                     gate_init=hyper_gate_init,
