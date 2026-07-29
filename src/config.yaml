@@ -8,9 +8,9 @@ plm: roberta
 bert_dir: ./plm/chinese-roberta-wwm-ext/
 
 # parameter 
-epoch_size: 20
+epoch_size: 10
 batchsize: 16
-patience: 10
+patience: 3
 max_grad_norm: 1.0
 warmup_proportion: 0.1
 gradient_accumulation_steps: 1
@@ -26,11 +26,26 @@ topology_gate_init: -2.0
 label_smoothing: 0.05
 alpha: 0
 
-# speaker hypergraph (v2) — target-aware readout
+# episode hypergraph (v2): reply-chain + interaction events
 use_speaker_hypergraph: 1
-speaker_hypergraph_k: 3
-speaker_hypergraph_min_size: 1
-hypergraph_dropout: 0.3
-hypergraph_gate_init: -4.0
-hypergraph_lr: 2.0e-6
+use_reply_chain_hyperedge: 1
+use_interaction_hyperedge: 1
+reply_hypergraph_depth: 2
+reply_hypergraph_min_size: 2
+interaction_hypergraph_min_size: 2
+episode_attention_dim: 128
+episode_hypergraph_dropout: 0.3
+episode_gate_init: -2.0
+episode_gate_max: 0.15
+hypergraph_time_decay_init: -2.5
+hypergraph_lr: 1.0e-5
 weight_decay: 1.0e-4
+
+# staged fine-tuning (0 = train all modules from start)
+staged_training: 0
+stage_a_epochs: 2
+stage_b_epochs: 3
+bert_lr_stage_c: 1.0e-6
+other_lr_stage_b: 2.0e-6
+other_lr_stage_c: 1.0e-6
+hypergraph_lr_stage_c: 5.0e-6

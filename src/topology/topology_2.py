@@ -435,74 +435,101 @@ class TwoChannelTopologyEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Target-aware speaker hyperedge readout (v2)
+# Episode hypergraph readout: reply-chain + interaction events → target
 # ---------------------------------------------------------------------------
 
-class TargetAwareSpeakerHypergraph(nn.Module):
+class EpisodeHypergraphReadout(nn.Module):
     """
-    Speaker hyperedge readout for the final utterance only.
+    Directed set-to-target readout over reply-chain / interaction episodes.
 
-    - Pool each speaker's history with target-conditioned attention + time decay.
-    - Exclude the target utterance from history pooling.
-    - Let the target attend over all speaker hyperedge representations.
-    - gate=0 is an exact identity on the target node (no extra LayerNorm on full graph).
+    Members encode role + relation; target attends members then events; bounded residual.
     """
 
-    def __init__(self, hidden_dim, dropout=0.3, gate_init=-4.0):
+    def __init__(
+        self,
+        hidden_dim,
+        attention_dim=128,
+        num_roles=4,
+        num_relations=8,
+        num_episode_types=2,
+        dropout=0.3,
+        gate_init=-2.0,
+        gate_max=0.15,
+        time_decay_init=-2.5,
+    ):
         super().__init__()
-        self.node_query = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.node_key = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.node_value = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.edge_query = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.edge_key = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.edge_value = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.time_decay = nn.Parameter(torch.tensor(-1.0))
+        self.query = nn.Linear(hidden_dim, attention_dim, bias=False)
+        self.key = nn.Linear(hidden_dim, attention_dim, bias=False)
+        self.value = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.role_emb = nn.Embedding(num_roles, hidden_dim)
+        self.relation_emb = nn.Embedding(num_relations, hidden_dim)
+        self.type_bias = nn.Embedding(num_episode_types, 1)
+        self.time_decay_logit = nn.Parameter(torch.tensor(float(time_decay_init)))
         self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+        self.gate_max = float(gate_max)
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
-        self.scale = hidden_dim ** -0.5
+        self.scale = attention_dim ** -0.5
 
     def gate_weight(self):
-        return torch.sigmoid(self.gate_logit)
+        return self.gate_max * torch.sigmoid(self.gate_logit)
 
     def forward(self, nodes, graph):
         target_id = nodes.size(0) - 1
         target = nodes[target_id]
 
-        hyperedge_index = _graph_tensor(graph, 'speaker_hyperedge_index')
-        if hyperedge_index is None or hyperedge_index.numel() == 0:
+        member_index = _graph_tensor(graph, 'episode_member_index')
+        if member_index is None or member_index.numel() == 0:
             return nodes
 
-        hyperedge_index = hyperedge_index.to(nodes.device)
-        node_ids = hyperedge_index[0].long()
-        edge_ids = hyperedge_index[1].long()
-        num_hyperedges = _graph_scalar(graph, 'num_speaker_hyperedges', 0)
+        member_index = member_index.to(nodes.device)
+        node_ids = member_index[0].long()
+        episode_ids = member_index[1].long()
+        num_episodes = _graph_scalar(graph, 'num_episodes', 0)
 
-        edge_reprs = []
-        gamma = F.softplus(self.time_decay)
-        q_node = self.node_query(target)
+        roles = _graph_tensor(graph, 'episode_member_role')
+        relations = _graph_tensor(graph, 'episode_member_relation')
+        ep_types = _graph_tensor(graph, 'episode_type')
 
-        for edge_id in range(num_hyperedges):
-            members = node_ids[edge_ids == edge_id]
-            members = members[members != target_id]
-            if members.numel() == 0:
+        if roles is not None:
+            roles = roles.to(nodes.device).long()
+        if relations is not None:
+            relations = relations.to(nodes.device).long()
+        if ep_types is not None:
+            ep_types = ep_types.to(nodes.device).long()
+
+        episode_reprs = []
+        gamma = F.softplus(self.time_decay_logit)
+        q_target = self.query(target)
+        denom = max(float(target_id), 1.0)
+
+        for ep_id in range(num_episodes):
+            mask = episode_ids == ep_id
+            if not mask.any():
                 continue
 
+            members = node_ids[mask]
             history = nodes[members]
-            scores = (q_node * self.node_key(history)).sum(dim=-1) * self.scale
-            distance = (target_id - members).to(dtype=nodes.dtype, device=nodes.device)
+            member_roles = roles[mask] if roles is not None else torch.zeros(members.size(0), dtype=torch.long, device=nodes.device)
+            member_rels = relations[mask] if relations is not None else torch.zeros(members.size(0), dtype=torch.long, device=nodes.device)
+
+            encoded = history + self.role_emb(member_roles) + self.relation_emb(member_rels)
+            scores = (q_target * self.key(encoded)).sum(dim=-1) * self.scale
+            distance = (target_id - members).to(dtype=nodes.dtype, device=nodes.device) / denom
             scores = scores - gamma * distance
             weights = torch.softmax(scores, dim=0)
-            edge_repr = (weights.unsqueeze(-1) * self.node_value(history)).sum(dim=0)
-            edge_reprs.append(edge_repr)
+            episode_reprs.append((weights.unsqueeze(-1) * self.value(encoded)).sum(dim=0))
 
-        if not edge_reprs:
+        if not episode_reprs:
             return nodes
 
-        edge_reprs = torch.stack(edge_reprs)
-        edge_scores = (self.edge_query(target) * self.edge_key(edge_reprs)).sum(dim=-1) * self.scale
-        edge_weights = torch.softmax(edge_scores, dim=0)
-        hyper_context = (edge_weights.unsqueeze(-1) * self.edge_value(edge_reprs)).sum(dim=0)
+        episode_reprs = torch.stack(episode_reprs)
+        ep_scores = (self.query(target) * self.key(episode_reprs)).sum(dim=-1) * self.scale
+        if ep_types is not None and ep_types.numel() == episode_reprs.size(0):
+            ep_scores = ep_scores + self.type_bias(ep_types).squeeze(-1)
+
+        ep_weights = torch.softmax(ep_scores, dim=0)
+        hyper_context = (ep_weights.unsqueeze(-1) * self.value(episode_reprs)).sum(dim=0)
         hyper_context = self.dropout(hyper_context)
 
         candidate = self.norm(target + hyper_context)
@@ -514,5 +541,6 @@ class TargetAwareSpeakerHypergraph(nn.Module):
         return output
 
 
-# Backward-compatible alias
-SpeakerHypergraphEncoder = TargetAwareSpeakerHypergraph
+LightweightSpeakerHypergraph = EpisodeHypergraphReadout
+TargetAwareSpeakerHypergraph = EpisodeHypergraphReadout
+SpeakerHypergraphEncoder = EpisodeHypergraphReadout

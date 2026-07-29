@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModel
 import torch.nn.functional as F
 from src.common import map_sequence, target_CL
-from src.topology.topology_2 import TwoChannelTopologyEncoder, TargetAwareSpeakerHypergraph
+from src.topology.topology_2 import TwoChannelTopologyEncoder, EpisodeHypergraphReadout
 
 
 class Attention(nn.Module):
@@ -86,12 +86,21 @@ class SITCL(nn.Module):
                 gate_init=gate_init,
             )
             if self.use_hypergraph:
-                hyper_dropout = float(getattr(config, 'hypergraph_dropout', 0.3))
-                hyper_gate_init = float(getattr(config, 'hypergraph_gate_init', -4.0))
-                self.hypergraph_encoder = TargetAwareSpeakerHypergraph(
+                attn_dim = int(getattr(config, 'episode_attention_dim', getattr(config, 'hypergraph_attention_dim', 128)))
+                ep_dropout = float(getattr(config, 'episode_hypergraph_dropout', getattr(config, 'hypergraph_dropout', 0.3)))
+                ep_gate_init = float(getattr(config, 'episode_gate_init', getattr(config, 'hypergraph_gate_init', -2.0)))
+                ep_gate_max = float(getattr(config, 'episode_gate_max', getattr(config, 'hypergraph_gate_max', 0.15)))
+                time_decay_init = float(getattr(config, 'hypergraph_time_decay_init', -2.5))
+                self.hypergraph_encoder = EpisodeHypergraphReadout(
                     config.gru_hidden,
-                    dropout=hyper_dropout,
-                    gate_init=hyper_gate_init,
+                    attention_dim=attn_dim,
+                    num_roles=4,
+                    num_relations=8,
+                    num_episode_types=2,
+                    dropout=ep_dropout,
+                    gate_init=ep_gate_init,
+                    gate_max=ep_gate_max,
+                    time_decay_init=time_decay_init,
                 )
             else:
                 self.hypergraph_encoder = None
