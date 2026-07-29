@@ -1,0 +1,37 @@
+{
+  "示例目标": {
+    "target_type": "policy",
+    "canonical_name": "示例目标",
+    "aliases": ["示例别名"],
+    "description": "此处只描述 target 是什么，不涉及数据集中任何立场标签。",
+    "scope_note": "讨论范围限定于公开政策含义，不包含同名其他实体。",
+    "key_facts": ["事实1", "事实2"],
+    "favor": {
+      "possible_attitudes": ["支持者可能认可其预期收益"],
+      "reasons": ["可能带来效率提升", "可能改善公共服务"],
+      "keywords": ["效率", "公共服务", "创新"]
+    },
+    "against": {
+      "possible_attitudes": ["批评者可能担忧实施成本"],
+      "reasons": ["可能增加财政压力", "可能引发公平争议"],
+      "keywords": ["成本", "公平", "监管"]
+    },
+    "neutral": {
+      "possible_attitudes": ["中立讨论可能关注证据与条件"],
+      "analysis_dimensions": ["实施路径", "证据充分性", "监管框架"],
+      "keywords": ["证据", "条件", "监管", "评估"]
+    },
+    "ambiguity_note": "",
+    "knowledge_as_of": "2026-07-29",
+    "confidence": "medium",
+    "sources": [
+      {
+        "title": "官方说明",
+        "publisher": "示例机构",
+        "source_type": "official",
+        "date": "2026-01-01",
+        "url": "https://example.org/overview"
+      }
+    ]
+  }
+}

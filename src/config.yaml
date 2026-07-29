@@ -49,3 +49,11 @@ bert_lr_stage_c: 1.0e-6
 other_lr_stage_b: 2.0e-6
 other_lr_stage_c: 1.0e-6
 hypergraph_lr_stage_c: 5.0e-6
+
+# v3 — label-free web target knowledge (zero-shot with external target knowledge)
+use_target_knowledge: 1
+require_target_knowledge: 0
+target_manifest_path: data/target_manifest.json
+target_knowledge_full_path: data/target_knowledge_web_full.json
+target_knowledge_path: data/target_knowledge_model.json
+target_knowledge_max_chars: 200
