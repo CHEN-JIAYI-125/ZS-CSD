@@ -4,6 +4,7 @@ import argparse
 import torch
 import torch.nn as nn
 import numpy as np
+from collections import Counter
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 import pandas as pd
@@ -38,7 +39,50 @@ class Main:
         set_seed(self.config.seed)
         self.config.device = torch.device('cuda:{}'.format(self.config.cuda_index) if torch.cuda.is_available() else 'cpu')
         self.best_epoch = 0
-        self.best_test_macro_f1 = 0.0
+        self.best_dev_macro_f1 = 0.0
+        self._current_stage = None
+        self.training_stage = 'all'
+
+    def _set_requires_grad_for_stage(self, stage):
+        for name, param in self.model.named_parameters():
+            if stage == 'a':
+                param.requires_grad = 'hypergraph_encoder' in name
+            elif stage == 'b':
+                param.requires_grad = (
+                    'hypergraph_encoder' in name
+                    or 'topology_encoder' in name
+                    or 'fusion_gate' in name
+                    or name.startswith('fc.')
+                )
+            else:
+                param.requires_grad = True
+
+    def _apply_training_stage(self, epoch):
+        if not bool(getattr(self.config, 'staged_training', 0)):
+            if self._current_stage != 'all':
+                self._current_stage = 'all'
+                self.training_stage = 'all'
+                self._set_requires_grad_for_stage('all')
+                self.load_param()
+            return
+
+        stage_a = int(getattr(self.config, 'stage_a_epochs', 2))
+        stage_b = int(getattr(self.config, 'stage_b_epochs', 3))
+        if epoch < stage_a:
+            stage = 'a'
+        elif epoch < stage_a + stage_b:
+            stage = 'b'
+        else:
+            stage = 'c'
+
+        if stage == self._current_stage:
+            return
+
+        self._current_stage = stage
+        self.training_stage = stage
+        self._set_requires_grad_for_stage(stage)
+        self.load_param()
+        logging.info('Switched training stage to %s at epoch %d', stage, epoch + 1)
 
     def train_iter(self):
         self.model.train()
@@ -77,6 +121,12 @@ class Main:
                 doc_id_lst.extend(data['doc_id'])
         val_loss /= len(dataLoader)
         macro_f1, favor, against, neutral, f1_avg, acc = self.get_metrices(seq_trues, seq_preds)
+        if mode == 'dev':
+            logging.info(
+                'Dev label dist=%s, pred dist=%s',
+                dict(Counter(seq_trues)),
+                dict(Counter(seq_preds)),
+            )
         if mode == 'test':
             result = {'doc_id': doc_id_lst, 'true': seq_trues, 'pred': seq_preds}
             df = pd.DataFrame(result)
@@ -84,40 +134,128 @@ class Main:
         return macro_f1, val_loss, favor, against, neutral, f1_avg, acc
 
     def train(self):
-        best_dev_f1 = 0.0
+        best_dev_f1 = -1.0
+        stale_epochs = 0
+        patience = int(getattr(self.config, 'patience', 3))
+        best_ckpt = self.save_dir + 'best_model.pth'
+
         for epoch in range(self.config.epoch_size):
+            self._apply_training_stage(epoch)
             train_loss = self.train_iter()
-            dev_macro_f1, dev_loss, *_ = self.evaluate_iter(mode='dev')
-            logging.info(f'Epoch {epoch+1}, Train Loss: {train_loss:.2f}, Val Loss: {dev_loss:.2f}, Val Macro F1: {100 * dev_macro_f1:.2f}')
-            if dev_macro_f1 >= best_dev_f1:
+            dev_macro_f1, dev_loss, favor_f1, against_f1, neutral_f1, _, dev_acc = self.evaluate_iter(mode='dev')
+
+            topology_gates = None
+            hyper_gate = None
+            if hasattr(self.model, 'get_topology_gates'):
+                topology_gates = self.model.get_topology_gates()
+            if hasattr(self.model, 'get_hypergraph_gate'):
+                hyper_gate = self.model.get_hypergraph_gate()
+
+            logging.info(
+                'Epoch %d, Train Loss=%.4f, Val Loss=%.4f, Macro F1=%.2f, '
+                'Favor=%.2f, Against=%.2f, Neutral=%.2f, Acc=%.2f, '
+                'Topology gates=%s, Hyper gate=%s',
+                epoch + 1,
+                train_loss,
+                dev_loss,
+                100 * dev_macro_f1,
+                100 * favor_f1,
+                100 * against_f1,
+                100 * neutral_f1,
+                100 * dev_acc,
+                topology_gates,
+                hyper_gate,
+            )
+
+            if dev_macro_f1 > best_dev_f1 + 1e-4:
                 best_dev_f1 = dev_macro_f1
-                test_macro_f1, test_loss, *_ = self.evaluate_iter(mode='test')
-                logging.info(f'Test Loss: {test_loss:.2f}, Test Macro F1: {100 * test_macro_f1:.2f}')
+                stale_epochs = 0
                 self.best_epoch = epoch + 1
-                torch.save(self.model.state_dict(), self.save_dir + 'best_model.pth')
+                self.best_dev_macro_f1 = best_dev_f1
+                torch.save(self.model.state_dict(), best_ckpt)
+            else:
+                stale_epochs += 1
+
+            if stale_epochs >= patience:
+                logging.info(
+                    'Early stop at epoch %d; best epoch=%d, best dev Macro F1=%.2f',
+                    epoch + 1,
+                    self.best_epoch,
+                    100 * best_dev_f1,
+                )
+                break
+
+        if os.path.isfile(best_ckpt):
+            self.model.load_state_dict(
+                torch.load(best_ckpt, map_location=self.config.device),
+            )
+            logging.info('Loaded best dev checkpoint from epoch %d', self.best_epoch)
+
+        test_macro_f1, test_loss, favor_f1, against_f1, neutral_f1, _, test_acc = self.evaluate_iter(mode='test')
+        logging.info(
+            'Final Test: Loss=%.4f, Macro F1=%.2f, Favor=%.2f, Against=%.2f, Neutral=%.2f, Acc=%.2f',
+            test_loss,
+            100 * test_macro_f1,
+            100 * favor_f1,
+            100 * against_f1,
+            100 * neutral_f1,
+            100 * test_acc,
+        )
 
     def load_param(self):
         param_optimizer = list(self.model.named_parameters())
         no_decay = ['bias', 'LayerNorm.weight']
-        bert_lr = float(self.config.bert_lr)
-        other_lr = float(self.config.other_lr)
-        hyper_lr = float(getattr(self.config, 'hypergraph_lr', 2e-6))
+        stage = getattr(self, 'training_stage', 'all')
+
+        if stage == 'c':
+            bert_lr = float(getattr(self.config, 'bert_lr_stage_c', 1e-6))
+            other_lr = float(getattr(self.config, 'other_lr_stage_c', 1e-6))
+            hyper_lr = float(getattr(self.config, 'hypergraph_lr_stage_c', 5e-6))
+        elif stage == 'b':
+            bert_lr = 0.0
+            other_lr = float(getattr(self.config, 'other_lr_stage_b', 2e-6))
+            hyper_lr = float(getattr(self.config, 'hypergraph_lr', 1e-5))
+        elif stage == 'a':
+            bert_lr = 0.0
+            other_lr = 0.0
+            hyper_lr = float(getattr(self.config, 'hypergraph_lr', 1e-5))
+        else:
+            bert_lr = float(self.config.bert_lr)
+            other_lr = float(self.config.other_lr)
+            hyper_lr = float(getattr(self.config, 'hypergraph_lr', 1e-5))
+
         wd = float(self.config.weight_decay)
 
         def is_hyper(name):
-            return 'hypergraph' in name
+            return 'hypergraph_encoder' in name
+
+        def trainable(name, param):
+            return param.requires_grad
 
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in param_optimizer if 'bert' in n and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': bert_lr},
-            {'params': [p for n, p in param_optimizer if 'bert' in n and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': bert_lr},
-            {'params': [p for n, p in param_optimizer if 'bert' not in n and is_hyper(n) and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': hyper_lr},
-            {'params': [p for n, p in param_optimizer if 'bert' not in n and is_hyper(n) and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': hyper_lr},
-            {'params': [p for n, p in param_optimizer if 'bert' not in n and not is_hyper(n) and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': other_lr},
-            {'params': [p for n, p in param_optimizer if 'bert' not in n and not is_hyper(n) and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': other_lr},
+            {'params': [p for n, p in param_optimizer if trainable(n, p) and 'bert' in n and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': bert_lr},
+            {'params': [p for n, p in param_optimizer if trainable(n, p) and 'bert' in n and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': bert_lr},
+            {'params': [p for n, p in param_optimizer if trainable(n, p) and 'bert' not in n and is_hyper(n) and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': hyper_lr},
+            {'params': [p for n, p in param_optimizer if trainable(n, p) and 'bert' not in n and is_hyper(n) and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': hyper_lr},
+            {'params': [p for n, p in param_optimizer if trainable(n, p) and 'bert' not in n and not is_hyper(n) and not any(nd in n for nd in no_decay)], 'weight_decay': wd, 'lr': other_lr},
+            {'params': [p for n, p in param_optimizer if trainable(n, p) and 'bert' not in n and not is_hyper(n) and any(nd in n for nd in no_decay)], 'weight_decay': 0, 'lr': other_lr},
         ]
+        optimizer_grouped_parameters = [
+            group for group in optimizer_grouped_parameters if len(group['params']) > 0
+        ]
+
         self.optimizer = AdamW(optimizer_grouped_parameters, eps=float(self.config.adam_epsilon))
-        self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=self.config.warmup_steps,
-                                                         num_training_steps=self.config.epoch_size * len(self.trainLoader))
+        total_steps = self.config.epoch_size * len(self.trainLoader)
+        warmup_steps = int(getattr(self.config, 'warmup_steps', 0))
+        if warmup_steps <= 0:
+            warmup_steps = int(
+                float(getattr(self.config, 'warmup_proportion', 0.1)) * total_steps
+            )
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
 
     def get_metrices(self, trues, preds):   
         f1_macro = f1_score(y_true=trues, y_pred=preds, average='macro')
@@ -143,6 +281,10 @@ class Main:
                 len(unexpected),
             )
         self.load_param()
+        if bool(getattr(self.config, 'staged_training', 0)):
+            self._set_requires_grad_for_stage('a')
+            self._current_stage = None
+            self._apply_training_stage(0)
         logging.info('Start training...')
         self.train()
         logging.info('End training...')
