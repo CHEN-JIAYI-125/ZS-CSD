@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModel
 import torch.nn.functional as F
 from src.common import map_sequence, target_CL
-from src.topology.topology_3 import TwoChannelTopologyEncoder, EpisodeHypergraphReadout
+from src.topology.topology_3 import TwoChannelTopologyEncoder
 
 
 class Attention(nn.Module):
@@ -65,9 +65,7 @@ class SITCL(nn.Module):
         self.config = config
         self.alpha = config.alpha
         self.use_topology = bool(getattr(config, 'use_topology', 1))
-        self.use_hypergraph = bool(getattr(config, 'use_speaker_hypergraph', 1))
         self.last_topology_gates = None
-        self.last_hypergraph_gate = None
         self.bert = AutoModel.from_pretrained(config.bert_dir)
         self.gru = nn.GRU(input_size=768, hidden_size=config.gru_hidden, num_layers=config.gru_layer, batch_first=True)
         self.fc = nn.Linear(config.gru_hidden, config.num_classes)
@@ -85,29 +83,7 @@ class SITCL(nn.Module):
                 dropout=dropout,
                 gate_init=gate_init,
             )
-            if self.use_hypergraph:
-                attn_dim = int(getattr(config, 'episode_attention_dim', getattr(config, 'hypergraph_attention_dim', 128)))
-                ep_dropout = float(getattr(config, 'episode_hypergraph_dropout', getattr(config, 'hypergraph_dropout', 0.3)))
-                ep_gate_init = float(getattr(config, 'episode_gate_init', getattr(config, 'hypergraph_gate_init', -2.0)))
-                ep_gate_max = float(getattr(config, 'episode_gate_max', getattr(config, 'hypergraph_gate_max', 0.15)))
-                time_decay_init = float(getattr(config, 'hypergraph_time_decay_init', -2.5))
-                self.hypergraph_encoder = EpisodeHypergraphReadout(
-                    config.gru_hidden,
-                    attention_dim=attn_dim,
-                    num_roles=4,
-                    num_relations=8,
-                    num_episode_types=2,
-                    dropout=ep_dropout,
-                    gate_init=ep_gate_init,
-                    gate_max=ep_gate_max,
-                    time_decay_init=time_decay_init,
-                )
-            else:
-                self.hypergraph_encoder = None
             self.fusion_gate = nn.Linear(config.gru_hidden * 2, config.gru_hidden)
-        else:
-            self.topology_encoder = None
-            self.hypergraph_encoder = None
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -124,12 +100,6 @@ class SITCL(nn.Module):
             return None
         with torch.no_grad():
             return self.topology_encoder.channel_weights().detach().cpu().tolist()
-
-    def get_hypergraph_gate(self):
-        if not self.use_hypergraph or self.hypergraph_encoder is None:
-            return None
-        with torch.no_grad():
-            return float(self.hypergraph_encoder.gate_weight().detach().cpu())
 
     def _extract_utterance_hidden(self, out, st, ed, mask_positions, dia_id):
         if mask_positions is not None:
@@ -161,11 +131,7 @@ class SITCL(nn.Module):
 
             if self.use_topology and topology_graphs is not None:
                 topology_v = self.topology_encoder(v, topology_graphs[dia_id])
-                if self.use_hypergraph and self.hypergraph_encoder is not None:
-                    joint_v = self.hypergraph_encoder(topology_v, topology_graphs[dia_id])
-                else:
-                    joint_v = topology_v
-                topology_final = joint_v[-1]
+                topology_final = topology_v[-1]
                 gate = torch.sigmoid(self.fusion_gate(torch.cat([h_sem, topology_final], dim=-1)))
                 final_state = gate * topology_final + (1.0 - gate) * h_sem
             else:
@@ -176,8 +142,6 @@ class SITCL(nn.Module):
 
         if self.use_topology and self.topology_encoder is not None:
             self.last_topology_gates = self.get_topology_gates()
-        if self.use_hypergraph and self.hypergraph_encoder is not None:
-            self.last_hypergraph_gate = self.get_hypergraph_gate()
 
         stance = torch.stack(stance)
         logits = self.fc(stance)

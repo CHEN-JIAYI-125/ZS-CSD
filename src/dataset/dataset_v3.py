@@ -58,20 +58,6 @@ EDGE_TYPE_WEIGHTS = {
     EDGE_SELF: 1.0,
 }
 
-# Episode hypergraph (v2): reply-chain & interaction events
-ROLE_GRANDPARENT = 0
-ROLE_PARENT = 1
-ROLE_SELF_HISTORY = 2
-ROLE_OPPONENT_HISTORY = 3
-
-EPISODE_REPLY_CHAIN = 0
-EPISODE_INTERACTION = 1
-
-NUM_EPISODE_ROLES = 4
-NUM_EPISODE_TYPES = 2
-NUM_REPLY_RELATIONS = 8
-
-# Label-free web target knowledge (v3): model reads compressed cards only.
 MODEL_KNOWLEDGE_FIELDS = (
     'description',
     'favor_reason',
@@ -92,9 +78,8 @@ class MyDataset(Dataset):
 
 class DataProcessor():
     """
-    v3: zero-shot stance with optional label-free external target knowledge cards.
-
-    Knowledge JSON must not be derived from dialogue text or stance labels.
+    v3 dataset loader. Target knowledge is read from a local JSON at init time only.
+    Training never performs web search or live knowledge retrieval.
     """
 
     MODEL_KNOWLEDGE_FIELDS = MODEL_KNOWLEDGE_FIELDS
@@ -114,87 +99,46 @@ class DataProcessor():
         return text[: max_chars - 1].rstrip() + '…'
 
     @classmethod
-    def normalize_full_entry_to_model(cls, entry):
-        """Map web-full schema or model schema to four short fields."""
+    def normalize_model_entry(cls, entry):
         if not isinstance(entry, dict):
             return {field: '' for field in MODEL_KNOWLEDGE_FIELDS}
-
         if all(field in entry for field in MODEL_KNOWLEDGE_FIELDS):
             return {field: str(entry.get(field, '')).strip() for field in MODEL_KNOWLEDGE_FIELDS}
 
-        def join_reasons(block, key='reasons', limit=2):
+        def join_block(block, key='reasons'):
             if not isinstance(block, dict):
                 return ''
-            reasons = block.get(key) or block.get('possible_attitudes') or []
-            if isinstance(reasons, str):
-                return reasons.strip()
-            return '；'.join(str(x).strip() for x in reasons[:limit] if str(x).strip())
+            values = block.get(key) or block.get('possible_attitudes') or []
+            if isinstance(values, str):
+                return values.strip()
+            return '；'.join(str(x).strip() for x in values[:2] if str(x).strip())
 
-        def join_keywords(block, limit=6):
-            if not isinstance(block, dict):
-                return ''
-            keywords = block.get('keywords') or []
-            if isinstance(keywords, str):
-                return keywords.strip()
-            return '、'.join(str(x).strip() for x in keywords[:limit] if str(x).strip())
-
-        favor_block = entry.get('favor', {})
-        against_block = entry.get('against', {})
-        neutral_block = entry.get('neutral', {})
-
-        favor_reason = join_reasons(favor_block)
-        against_reason = join_reasons(against_block)
-        neutral_hint = join_reasons(neutral_block, key='analysis_dimensions') or join_reasons(neutral_block)
-
-        favor_kw = join_keywords(favor_block)
-        against_kw = join_keywords(against_block)
-        neutral_kw = join_keywords(neutral_block)
-
-        if favor_kw:
-            favor_reason = (favor_reason + '；关键词：' + favor_kw).strip('；')
-        if against_kw:
-            against_reason = (against_reason + '；关键词：' + against_kw).strip('；')
-        if neutral_kw:
-            neutral_hint = (neutral_hint + '；关键词：' + neutral_kw).strip('；')
-
-        aliases = entry.get('aliases') or []
-        alias_text = ''
-        if isinstance(aliases, list) and aliases:
-            alias_text = '别名：' + '、'.join(str(a) for a in aliases[:3])
-
+        favor = entry.get('favor', {})
+        against = entry.get('against', {})
+        neutral = entry.get('neutral', {})
         description = str(entry.get('description', '')).strip()
         scope = str(entry.get('scope_note', '')).strip()
         if scope:
             description = (description + ' ' + scope).strip()
-        if alias_text:
-            description = (description + ' ' + alias_text).strip()
-
         return {
             'description': description,
-            'favor_reason': favor_reason,
-            'against_reason': against_reason,
-            'neutral_hint': neutral_hint,
+            'favor_reason': join_block(favor),
+            'against_reason': join_block(against),
+            'neutral_hint': join_block(neutral, key='analysis_dimensions') or join_block(neutral),
         }
 
     @classmethod
     def compress_knowledge_card(cls, fields, max_total=200):
-        """Deterministic priority compression for prompt injection."""
         desc_budget = min(60, max(40, max_total // 3))
         side_budget = min(45, max(30, (max_total - desc_budget) // 3))
-
-        parts_order = [
+        segments = []
+        used = 0
+        for key, label in [
             ('description', '说明'),
             ('favor_reason', '可能支持'),
             ('against_reason', '可能反对'),
             ('neutral_hint', '中性角度'),
-        ]
-
-        desc_budget = min(60, max(40, max_total // 3))
-        side_budget = min(45, max(30, (max_total - desc_budget) // 3))
-
-        segments = []
-        used = 0
-        for key, label in parts_order:
+        ]:
             raw = str(fields.get(key, '')).strip()
             if not raw:
                 continue
@@ -203,8 +147,6 @@ class DataProcessor():
             if cap <= 0:
                 break
             clipped = cls._truncate_field(raw, cap)
-            if not clipped:
-                continue
             segment = f'{label}：{clipped}'
             if used + len(segment) > max_total:
                 segment = cls._truncate_field(segment, max_total - used)
@@ -214,32 +156,50 @@ class DataProcessor():
             used += len(segment)
         return ' '.join(segments).strip()
 
+    def _entry_has_content(self, entry):
+        if isinstance(entry, str):
+            return bool(entry.strip())
+        if isinstance(entry, dict):
+            fields = self.normalize_model_entry(entry)
+            return any(fields[k] for k in MODEL_KNOWLEDGE_FIELDS)
+        return False
+
     def load_target_knowledge(self):
         if not self.use_target_knowledge:
-            logging.info('Target knowledge disabled (use_target_knowledge=0).')
+            logging.info('[Target Knowledge] disabled (use_target_knowledge=0)')
             return {}
 
         path = getattr(self.config, 'target_knowledge_path', '')
-        if not path or not os.path.exists(path):
-            logging.warning(
-                'Target knowledge path missing or not found: %s; falling back to target name only.',
-                path,
-            )
+        if not path:
+            logging.warning('[Target Knowledge] target_knowledge_path is empty; using target name fallback only')
+            return {}
+        if not os.path.exists(path):
+            logging.warning('[Target Knowledge] file not found: %s; using target name fallback only', path)
             return {}
 
         with open(path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
 
-        knowledge = {}
         max_total = int(getattr(self.config, 'target_knowledge_max_chars', 200))
+        knowledge = {}
+        empty_targets = []
         for target, value in raw.items():
+            if not self._entry_has_content(value):
+                empty_targets.append(str(target))
+                continue
             if isinstance(value, str):
                 knowledge[str(target)] = self._truncate_field(value, max_total)
                 continue
-            fields = self.normalize_full_entry_to_model(value)
+            fields = self.normalize_model_entry(value)
             knowledge[str(target)] = self.compress_knowledge_card(fields, max_total=max_total)
 
-        logging.info('Loaded target knowledge for %d targets from %s', len(knowledge), path)
+        logging.info('[Target Knowledge] loaded %d non-empty targets from %s', len(knowledge), path)
+        if empty_targets:
+            logging.warning(
+                '[Target Knowledge] skipped %d empty entries (examples: %s)',
+                len(empty_targets),
+                empty_targets[:5],
+            )
         return knowledge
 
     def collect_dataset_targets(self):
@@ -256,30 +216,41 @@ class DataProcessor():
     def _log_and_validate_target_knowledge(self):
         if not self.use_target_knowledge:
             return
+
         all_targets = self.collect_dataset_targets()
         if not all_targets:
             return
+
         missing = all_targets - set(self.target_knowledge.keys())
-        coverage = 1.0 - (len(missing) / max(len(all_targets), 1))
+        covered = len(all_targets) - len(missing)
         logging.info(
-            'Target knowledge coverage: %.1f%% (%d/%d)',
-            100 * coverage,
-            len(all_targets) - len(missing),
+            '[Target Knowledge] coverage: %d/%d (%.1f%%)',
+            covered,
             len(all_targets),
+            100.0 * covered / len(all_targets),
         )
-        if missing and bool(getattr(self.config, 'require_target_knowledge', 0)):
-            sample = sorted(missing)[:10]
-            raise ValueError(f'Missing target knowledge for {len(missing)} targets, e.g. {sample}')
         if missing:
-            logging.warning('Missing target knowledge for %d targets (first: %s)', len(missing), sorted(missing)[:5])
+            logging.warning(
+                '[Target Knowledge] missing for %d targets, examples: %s',
+                len(missing),
+                sorted(missing)[:10],
+            )
+
+        if bool(getattr(self.config, 'require_target_knowledge', 0)) and missing:
+            raise ValueError(
+                f'Missing target knowledge for {len(missing)} targets; '
+                f'examples: {sorted(missing)[:10]}'
+            )
 
     def get_knowledge_text(self, dialogue):
         target = str(dialogue['target'])
+        target_type = dialogue.get('target_type', '')
         if not self.use_target_knowledge:
-            return f'target={target}; target_type={dialogue.get("target_type", "")}'
+            return f'target={target}; target_type={target_type}'
+
         text = self.target_knowledge.get(target, '')
         if not text:
-            text = f'target={target}; target_type={dialogue.get("target_type", "")}'
+            text = f'target={target}; target_type={target_type}'
         max_chars = int(getattr(self.config, 'target_knowledge_max_chars', 200))
         return text[:max_chars] if max_chars > 0 else text
 
@@ -385,146 +356,6 @@ class DataProcessor():
     def edge_type_weight(self, edge_type):
         return EDGE_TYPE_WEIGHTS.get(edge_type, 1.0)
 
-    def _find_latest_turn(self, speaker_ids, speaker, before, exclude=None):
-        exclude = exclude or set()
-        speaker = int(speaker)
-        for turn_id in range(before - 1, -1, -1):
-            if turn_id in exclude:
-                continue
-            if int(speaker_ids[turn_id]) == speaker:
-                return turn_id
-        return -1
-
-    def build_episode_hypergraph(self, speaker_ids, reply_parents, reply_relations):
-        """Reply-chain and interaction-episode hyperedges (target excluded from members)."""
-        target = len(speaker_ids) - 1
-        empty = {
-            'episode_member_index': torch.empty((2, 0), dtype=torch.long),
-            'episode_member_role': torch.empty((0,), dtype=torch.long),
-            'episode_member_relation': torch.empty((0,), dtype=torch.long),
-            'episode_type': torch.empty((0,), dtype=torch.long),
-            'episode_target': torch.empty((0,), dtype=torch.long),
-            'num_episodes': 0,
-        }
-        if target <= 0:
-            return empty
-
-        use_reply_chain = bool(getattr(self.config, 'use_reply_chain_hyperedge', 1))
-        use_interaction = bool(getattr(self.config, 'use_interaction_hyperedge', 1))
-        reply_min_size = int(getattr(self.config, 'reply_hypergraph_min_size', 2))
-        interaction_min_size = int(getattr(self.config, 'interaction_hypergraph_min_size', 2))
-
-        parent = int(reply_parents[target]) if target < len(reply_parents) else -1
-        episodes = []
-
-        if use_reply_chain and 0 <= parent < target:
-            grandparent = (
-                int(reply_parents[parent])
-                if parent < len(reply_parents)
-                else -1
-            )
-            members = []
-            roles = []
-            relations = []
-
-            if 0 <= grandparent < parent:
-                members.append(grandparent)
-                roles.append(ROLE_GRANDPARENT)
-                rel = reply_relations[parent] if parent < len(reply_relations) else RELATION_CROSS_REPLY
-                relations.append(int(rel))
-
-            members.append(parent)
-            roles.append(ROLE_PARENT)
-            rel = reply_relations[target] if target < len(reply_relations) else RELATION_CROSS_REPLY
-            relations.append(int(rel))
-
-            if len(members) >= reply_min_size:
-                episodes.append({
-                    'type': EPISODE_REPLY_CHAIN,
-                    'members': members,
-                    'roles': roles,
-                    'relations': relations,
-                    'target': target,
-                })
-
-        if use_interaction and 0 <= parent < target:
-            target_speaker = int(speaker_ids[target])
-            parent_speaker = int(speaker_ids[parent])
-
-            self_history = self._find_latest_turn(
-                speaker_ids,
-                target_speaker,
-                target,
-                exclude={parent},
-            )
-            opponent_history = self._find_latest_turn(
-                speaker_ids,
-                parent_speaker,
-                parent,
-            )
-
-            members = []
-            roles = []
-            relations = []
-
-            if self_history >= 0:
-                members.append(self_history)
-                roles.append(ROLE_SELF_HISTORY)
-                relations.append(RELATION_NONE)
-
-            if opponent_history >= 0:
-                members.append(opponent_history)
-                roles.append(ROLE_OPPONENT_HISTORY)
-                relations.append(RELATION_NONE)
-
-            members.append(parent)
-            roles.append(ROLE_PARENT)
-            relations.append(RELATION_NONE)
-
-            if len(members) >= interaction_min_size:
-                episodes.append({
-                    'type': EPISODE_INTERACTION,
-                    'members': members,
-                    'roles': roles,
-                    'relations': relations,
-                    'target': target,
-                })
-
-        if not episodes:
-            return empty
-
-        member_nodes = []
-        member_episodes = []
-        member_roles = []
-        member_relations = []
-        episode_types = []
-        episode_targets = []
-
-        for episode_id, episode in enumerate(episodes):
-            episode_types.append(episode['type'])
-            episode_targets.append(episode['target'])
-            for node_id, role, relation in zip(
-                episode['members'],
-                episode['roles'],
-                episode['relations'],
-            ):
-                member_nodes.append(node_id)
-                member_episodes.append(episode_id)
-                member_roles.append(role)
-                member_relations.append(relation)
-
-        return {
-            'episode_member_index': torch.tensor(
-                [member_nodes, member_episodes],
-                dtype=torch.long,
-            ),
-            'episode_member_role': torch.tensor(member_roles, dtype=torch.long),
-            'episode_member_relation': torch.tensor(member_relations, dtype=torch.long),
-            'episode_type': torch.tensor(episode_types, dtype=torch.long),
-            'episode_target': torch.tensor(episode_targets, dtype=torch.long),
-            'num_episodes': len(episodes),
-        }
-
     def build_topology_graph(self, speakers, reply_relations, reply_parents, reply_confidences=None, local_window=3):
         """Build utterance graph with edge_group for dual-channel propagation."""
         speaker_ids = [int(speaker) for speaker in speakers]
@@ -562,32 +393,34 @@ class DataProcessor():
         for turn_id, speaker in enumerate(speaker_ids):
             add_edge(turn_id, turn_id, EDGE_SELF, EDGE_GROUP_AUXILIARY, 1.0)
 
-            prev = turn_id - 1
+            if turn_id > 0:
+                prev = turn_id - 1
+                if speaker_ids[prev] != speaker:
+                    add_edge(
+                        prev,
+                        turn_id,
+                        EDGE_NEXT_TURN,
+                        EDGE_GROUP_CONTEXT,
+                        decay_weight(prev, turn_id),
+                    )
+
             parent = reply_parents[turn_id] if turn_id < len(reply_parents) else -1
             confidence = reply_confidences[turn_id] if reply_confidences is not None else 1.0
-            reply_is_prev = False
-
             if 0 <= parent < turn_id:
                 relation = reply_relations[turn_id] if turn_id < len(reply_relations) else RELATION_CROSS_REPLY
                 same_speaker_parent = speaker_ids[parent] == speaker
-                edge_type = self.reply_relation_to_edge_type(relation, same_speaker_parent)
-                edge_group = self.edge_type_to_group(edge_type)
+                if same_speaker_parent:
+                    edge_type = EDGE_SAME_SPEAKER
+                    edge_group = EDGE_GROUP_SPEAKER_HISTORY
+                else:
+                    edge_type = self.reply_relation_to_edge_type(relation, False)
+                    edge_group = EDGE_GROUP_CONTEXT
                 add_edge(
                     parent,
                     turn_id,
                     edge_type,
                     edge_group,
                     decay_weight(parent, turn_id, base=confidence),
-                )
-                reply_is_prev = parent == prev
-
-            if turn_id > 0 and speaker_ids[prev] != speaker and not reply_is_prev:
-                add_edge(
-                    prev,
-                    turn_id,
-                    EDGE_NEXT_TURN,
-                    EDGE_GROUP_CONTEXT,
-                    decay_weight(prev, turn_id),
                 )
 
             history = history_by_speaker.get(speaker, [])
@@ -603,12 +436,6 @@ class DataProcessor():
 
         assert len(edge_types) == len(edge_groups) == len(edge_weights), 'edge metadata length mismatch'
 
-        episode_values = self.build_episode_hypergraph(
-            speaker_ids,
-            reply_parents,
-            reply_relations,
-        )
-
         graph_values = {
             'num_utterance_nodes': num_turns,
             'num_nodes': num_turns,
@@ -620,12 +447,6 @@ class DataProcessor():
             'reply_parent': list(reply_parents),
             'reply_relation': list(reply_relations),
             'reply_confidence': list(reply_confidences) if reply_confidences is not None else [1.0] * num_turns,
-            'episode_member_index': episode_values['episode_member_index'],
-            'episode_member_role': episode_values['episode_member_role'],
-            'episode_member_relation': episode_values['episode_member_relation'],
-            'episode_type': episode_values['episode_type'],
-            'episode_target': episode_values['episode_target'],
-            'num_episodes': episode_values['num_episodes'],
         }
         if PyGData is None:
             return graph_values
@@ -636,12 +457,6 @@ class DataProcessor():
             edge_type=torch.tensor(edge_types, dtype=torch.long),
             edge_group=torch.tensor(edge_groups, dtype=torch.long),
             edge_weight=torch.tensor(edge_weights, dtype=torch.float),
-            episode_member_index=episode_values['episode_member_index'],
-            episode_member_role=episode_values['episode_member_role'],
-            episode_member_relation=episode_values['episode_member_relation'],
-            episode_type=episode_values['episode_type'],
-            episode_target=episode_values['episode_target'],
-            num_episodes=torch.tensor([episode_values['num_episodes']], dtype=torch.long),
         )
 
     def read_data(self, mode):
