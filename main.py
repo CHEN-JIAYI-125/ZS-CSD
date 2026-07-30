@@ -149,6 +149,12 @@ class Main:
                 self.best_epoch = epoch + 1
                 self.best_dev_macro_f1 = best_dev_f1
                 torch.save(self.model.state_dict(), best_ckpt)
+                test_macro_f1, test_loss, _, _, _, _, _ = self.evaluate_iter(mode='test')
+                logging.info(
+                    'Test Loss: %.2f, Test Macro F1: %.2f',
+                    test_loss,
+                    100 * test_macro_f1,
+                )
             else:
                 stale_epochs += 1
 
