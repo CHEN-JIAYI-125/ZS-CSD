@@ -8,9 +8,9 @@ plm: roberta
 bert_dir: ./plm/chinese-roberta-wwm-ext/
 
 # parameter 
-epoch_size: 10
+epoch_size: 20
 batchsize: 16
-patience: 3
+patience: 0  # 0 = disable early stopping; >0 stops after N epochs without dev F1 gain
 max_grad_norm: 1.0
 warmup_proportion: 0.1
 gradient_accumulation_steps: 1
@@ -41,10 +41,10 @@ hypergraph_time_decay_init: -2.5
 hypergraph_lr: 1.0e-5
 weight_decay: 1.0e-4
 
-# staged fine-tuning (0 = train all modules from start)
+# staged fine-tuning (only active when staged_training: 1)
 staged_training: 0
-stage_a_epochs: 2
-stage_b_epochs: 3
+stage_a_epochs: 2  # hypergraph only
+stage_b_epochs: 3  # hypergraph + topology + head
 bert_lr_stage_c: 1.0e-6
 other_lr_stage_b: 2.0e-6
 other_lr_stage_c: 1.0e-6

@@ -4,7 +4,6 @@ import argparse
 import torch
 import torch.nn as nn
 import numpy as np
-from collections import Counter
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 import pandas as pd
@@ -121,12 +120,6 @@ class Main:
                 doc_id_lst.extend(data['doc_id'])
         val_loss /= len(dataLoader)
         macro_f1, favor, against, neutral, f1_avg, acc = self.get_metrices(seq_trues, seq_preds)
-        if mode == 'dev':
-            logging.info(
-                'Dev label dist=%s, pred dist=%s',
-                dict(Counter(seq_trues)),
-                dict(Counter(seq_preds)),
-            )
         if mode == 'test':
             result = {'doc_id': doc_id_lst, 'true': seq_trues, 'pred': seq_preds}
             df = pd.DataFrame(result)
@@ -144,27 +137,12 @@ class Main:
             train_loss = self.train_iter()
             dev_macro_f1, dev_loss, favor_f1, against_f1, neutral_f1, _, dev_acc = self.evaluate_iter(mode='dev')
 
-            topology_gates = None
-            hyper_gate = None
-            if hasattr(self.model, 'get_topology_gates'):
-                topology_gates = self.model.get_topology_gates()
-            if hasattr(self.model, 'get_hypergraph_gate'):
-                hyper_gate = self.model.get_hypergraph_gate()
-
             logging.info(
-                'Epoch %d, Train Loss=%.4f, Val Loss=%.4f, Macro F1=%.2f, '
-                'Favor=%.2f, Against=%.2f, Neutral=%.2f, Acc=%.2f, '
-                'Topology gates=%s, Hyper gate=%s',
+                'Epoch %d, Train Loss: %.2f, Val Loss: %.2f, Val Macro F1: %.2f',
                 epoch + 1,
                 train_loss,
                 dev_loss,
                 100 * dev_macro_f1,
-                100 * favor_f1,
-                100 * against_f1,
-                100 * neutral_f1,
-                100 * dev_acc,
-                topology_gates,
-                hyper_gate,
             )
 
             if dev_macro_f1 > best_dev_f1 + 1e-4:
@@ -176,7 +154,7 @@ class Main:
             else:
                 stale_epochs += 1
 
-            if stale_epochs >= patience:
+            if patience > 0 and stale_epochs >= patience:
                 logging.info(
                     'Early stop at epoch %d; best epoch=%d, best dev Macro F1=%.2f',
                     epoch + 1,
@@ -193,13 +171,9 @@ class Main:
 
         test_macro_f1, test_loss, favor_f1, against_f1, neutral_f1, _, test_acc = self.evaluate_iter(mode='test')
         logging.info(
-            'Final Test: Loss=%.4f, Macro F1=%.2f, Favor=%.2f, Against=%.2f, Neutral=%.2f, Acc=%.2f',
+            'Test Loss: %.2f, Test Macro F1: %.2f',
             test_loss,
             100 * test_macro_f1,
-            100 * favor_f1,
-            100 * against_f1,
-            100 * neutral_f1,
-            100 * test_acc,
         )
 
     def load_param(self):
