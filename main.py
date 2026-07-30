@@ -137,13 +137,19 @@ class Main:
             train_loss = self.train_iter()
             dev_macro_f1, dev_loss, favor_f1, against_f1, neutral_f1, _, dev_acc = self.evaluate_iter(mode='dev')
 
-            logging.info(
-                'Epoch %d, Train Loss: %.2f, Val Loss: %.2f, Val Macro F1: %.2f',
-                epoch + 1,
-                train_loss,
-                dev_loss,
-                100 * dev_macro_f1,
+            log_msg = (
+                'Epoch %d, Train Loss: %.2f, Val Loss: %.2f, Val Macro F1: %.2f'
+                % (epoch + 1, train_loss, dev_loss, 100 * dev_macro_f1)
             )
+            if hasattr(self.model, 'get_topology_gates'):
+                topo_gates = self.model.get_topology_gates()
+                if topo_gates is not None:
+                    log_msg += f', Topo gates={topo_gates}'
+            if hasattr(self.model, 'get_knowledge_gate'):
+                know_gate = self.model.get_knowledge_gate()
+                if know_gate is not None:
+                    log_msg += f', Know gate={know_gate:.3f}'
+            logging.info(log_msg)
 
             if dev_macro_f1 > best_dev_f1 + 1e-4:
                 best_dev_f1 = dev_macro_f1

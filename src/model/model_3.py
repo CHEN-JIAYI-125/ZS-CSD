@@ -65,7 +65,9 @@ class SITCL(nn.Module):
         self.config = config
         self.alpha = config.alpha
         self.use_topology = bool(getattr(config, 'use_topology', 1))
+        self.use_knowledge_gate = bool(getattr(config, 'use_knowledge_gate', 1))
         self.last_topology_gates = None
+        self.last_knowledge_gate = None
         self.bert = AutoModel.from_pretrained(config.bert_dir)
         self.gru = nn.GRU(input_size=768, hidden_size=config.gru_hidden, num_layers=config.gru_layer, batch_first=True)
         self.fc = nn.Linear(config.gru_hidden, config.num_classes)
@@ -84,6 +86,17 @@ class SITCL(nn.Module):
                 gate_init=gate_init,
             )
             self.fusion_gate = nn.Linear(config.gru_hidden * 2, config.gru_hidden)
+            fusion_init = float(getattr(config, 'topology_fusion_gate_init', -1.0))
+            nn.init.zeros_(self.fusion_gate.weight)
+            nn.init.constant_(self.fusion_gate.bias, fusion_init)
+
+        if self.use_knowledge_gate:
+            self.knowledge_gate = nn.Linear(config.gru_hidden * 2, config.gru_hidden)
+            kg_init = float(getattr(config, 'knowledge_gate_init', 2.0))
+            nn.init.zeros_(self.knowledge_gate.weight)
+            nn.init.constant_(self.knowledge_gate.bias, kg_init)
+        else:
+            self.knowledge_gate = None
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -94,6 +107,29 @@ class SITCL(nn.Module):
         weights = 1.0 / torch.sqrt(torch.tensor(counts, dtype=torch.float))
         weights = weights / weights.mean()
         return weights.to(config.device)
+
+    def get_knowledge_gate(self):
+        if self.knowledge_gate is None or self.last_knowledge_gate is None:
+            return None
+        with torch.no_grad():
+            return float(self.last_knowledge_gate.detach().cpu().mean().item())
+
+    def _encode_knowledge(self, knowledge_input_ids, knowledge_input_masks, knowledge_input_segments):
+        if knowledge_input_ids is None or knowledge_input_masks is None:
+            return None
+        if knowledge_input_masks.sum().item() <= 0:
+            return None
+        know_out = self.bert(
+            input_ids=knowledge_input_ids,
+            attention_mask=knowledge_input_masks,
+            token_type_ids=knowledge_input_segments,
+        ).last_hidden_state
+        return know_out[:, 0, :]
+
+    def _fuse_knowledge(self, h_text, h_know):
+        gate = torch.sigmoid(self.knowledge_gate(torch.cat([h_text, h_know], dim=-1)))
+        self.last_knowledge_gate = gate.mean()
+        return gate * h_text + (1.0 - gate) * h_know
 
     def get_topology_gates(self):
         if not self.use_topology or self.topology_encoder is None:
@@ -117,8 +153,14 @@ class SITCL(nn.Module):
         targets = kwargs['target']
         mask_positions = kwargs.get('mask_positions')
         topology_graphs = kwargs.get('topology_graphs')
+        knowledge_input_ids = kwargs.get('knowledge_input_ids')
+        knowledge_input_masks = kwargs.get('knowledge_input_masks')
+        knowledge_input_segments = kwargs.get('knowledge_input_segments')
 
         out = self.bert(input_ids=input_ids, attention_mask=input_masks, token_type_ids=input_segments).last_hidden_state
+        h_know_all = self._encode_knowledge(
+            knowledge_input_ids, knowledge_input_masks, knowledge_input_segments,
+        )
 
         H_final = []
         stance = []
@@ -136,6 +178,16 @@ class SITCL(nn.Module):
                 final_state = gate * topology_final + (1.0 - gate) * h_sem
             else:
                 final_state = h_sem
+
+            if (
+                self.use_knowledge_gate
+                and self.knowledge_gate is not None
+                and h_know_all is not None
+                and h_know_all.size(0) > dia_id
+            ):
+                h_know = h_know_all[dia_id]
+                if knowledge_input_masks is not None and knowledge_input_masks[dia_id].sum().item() > 0:
+                    final_state = self._fuse_knowledge(final_state, h_know)
 
             H_final.append(v)
             stance.append(final_state)

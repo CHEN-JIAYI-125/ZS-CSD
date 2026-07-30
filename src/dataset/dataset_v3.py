@@ -128,7 +128,34 @@ class DataProcessor():
         }
 
     @classmethod
-    def compress_knowledge_card(cls, fields, max_total=200):
+    def compress_stance_knowledge(cls, fields, max_total=64):
+        side_budget = max(max_total // 2, 20)
+        segments = []
+        used = 0
+        for key, label in [
+            ('favor_reason', '可能支持'),
+            ('against_reason', '可能反对'),
+        ]:
+            raw = str(fields.get(key, '')).strip()
+            if not raw:
+                continue
+            cap = min(side_budget, max_total - used)
+            if cap <= 0:
+                break
+            clipped = cls._truncate_field(raw, cap)
+            segment = f'{label}：{clipped}'
+            if used + len(segment) > max_total:
+                segment = cls._truncate_field(segment, max_total - used)
+            if not segment:
+                break
+            segments.append(segment)
+            used += len(segment)
+        return ' '.join(segments).strip()
+
+    @classmethod
+    def compress_knowledge_card(cls, fields, max_total=200, stance_only=False):
+        if stance_only:
+            return cls.compress_stance_knowledge(fields, max_total=max_total)
         desc_budget = min(60, max(40, max_total // 3))
         side_budget = min(45, max(30, (max_total - desc_budget) // 3))
         segments = []
@@ -181,6 +208,7 @@ class DataProcessor():
             raw = json.load(f)
 
         max_total = int(getattr(self.config, 'target_knowledge_max_chars', 200))
+        stance_only = bool(getattr(self.config, 'knowledge_stance_only', 0))
         knowledge = {}
         empty_targets = []
         for target, value in raw.items():
@@ -191,7 +219,9 @@ class DataProcessor():
                 knowledge[str(target)] = self._truncate_field(value, max_total)
                 continue
             fields = self.normalize_model_entry(value)
-            knowledge[str(target)] = self.compress_knowledge_card(fields, max_total=max_total)
+            knowledge[str(target)] = self.compress_knowledge_card(
+                fields, max_total=max_total, stance_only=stance_only,
+            )
 
         logging.info('[Target Knowledge] loaded %d non-empty targets from %s', len(knowledge), path)
         if empty_targets:
@@ -483,6 +513,7 @@ class DataProcessor():
         reply_confidences = []
         target = dialogue["target"]
         knowledge = self.get_knowledge_text(dialogue)
+        use_knowledge_gate = bool(getattr(self.config, 'use_knowledge_gate', 1))
         speakers = dialogue["speakers"]
         raw_sentences = list(dialogue['sentences'])
         local_window = int(getattr(self.config, 'topology_local_window', 3))
@@ -493,9 +524,17 @@ class DataProcessor():
             parent, confidence = self.infer_reply_parent_with_confidence(id, speakers)
             reply_parents.append(parent)
             reply_confidences.append(confidence)
-            new_sen = f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为[MASK]。目标说明：{knowledge}[SEP]'
+            new_sen = (
+                f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为[MASK][SEP]'
+                if use_knowledge_gate
+                else f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为[MASK]。目标说明：{knowledge}[SEP]'
+            )
             if id == len(dialogue['sentences']) - 1:
-                label_sen = f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为{dialogue["label"]}。目标说明：{knowledge}[SEP]'
+                label_sen = (
+                    f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为{dialogue["label"]}[SEP]'
+                    if use_knowledge_gate
+                    else f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为{dialogue["label"]}。目标说明：{knowledge}[SEP]'
+                )
                 label_sen_token = self.tokenizer.tokenize(label_sen)
                 new_label_sen.append(label_sen_token)
             tokens = self.tokenizer.tokenize(new_sen)
@@ -520,15 +559,24 @@ class DataProcessor():
             local_window=local_window,
         )
         dialogue['mask_positions'] = mask_positions
+        if use_knowledge_gate and self.use_target_knowledge:
+            know_text = f'[CLS]关于[SEP]{target}[SEP]：{knowledge}[SEP]'
+            know_tokens = self.tokenizer.tokenize(know_text)
+            max_knowledge_len = int(getattr(self.config, 'max_knowledge_seq_length', 48))
+            if max_knowledge_len > 0 and len(know_tokens) > max_knowledge_len:
+                know_tokens = know_tokens[:max_knowledge_len - 1] + ['[SEP]']
+            dialogue['knowledge_tokens'] = know_tokens
+        else:
+            dialogue['knowledge_tokens'] = []
         return dialogue
 
     def transform2indices(self, data):
         res = []
         for document in data:
-            sentences, speakers, label, target_idx, target, label_sen, doc_id, reply_relations, reply_parents, topology_graph, mask_positions = [
+            sentences, speakers, label, target_idx, target, label_sen, doc_id, reply_relations, reply_parents, topology_graph, mask_positions, knowledge_tokens = [
                 document[w] for w in [
                     'sentences', 'speakers', 'label', 'target_idx', 'target', 'label_sen',
-                    'id', 'reply_relations', 'reply_parents', 'topology_graph', 'mask_positions'
+                    'id', 'reply_relations', 'reply_parents', 'topology_graph', 'mask_positions', 'knowledge_tokens'
                 ]
             ]
             all_label = document.get('all_label', [label] * len(sentences))
@@ -540,9 +588,16 @@ class DataProcessor():
             input_ids_label = list(map(self.tokenizer.convert_tokens_to_ids, label_sen))
             input_masks_label = [[1] * len(w) for w in input_ids_label]
             input_segments_label = [[0] * len(w) for w in input_ids_label]
+            if knowledge_tokens:
+                knowledge_ids = [self.tokenizer.convert_tokens_to_ids(knowledge_tokens)]
+                knowledge_masks = [[1] * len(knowledge_ids[0])]
+                knowledge_segments = [[0] * len(knowledge_ids[0])]
+            else:
+                knowledge_ids, knowledge_masks, knowledge_segments = [[]], [[]], [[]]
             res.append((
                 input_ids, input_masks, input_segments, speakers, label, all_label, target_idx, target,
-                reply_relations, reply_parents, topology_graph, input_ids_label, input_masks_label, input_segments_label, doc_id, mask_positions
+                reply_relations, reply_parents, topology_graph, input_ids_label, input_masks_label, input_segments_label, doc_id, mask_positions,
+                knowledge_ids, knowledge_masks, knowledge_segments,
             ))
         return res
 
@@ -554,7 +609,8 @@ class DataProcessor():
     def collate_fn_new(self, batch):
         (
             input_ids, input_masks, input_segments, speakers, label, all_label, target_idx, target,
-            reply_relations, reply_parents, topology_graphs, input_ids_label, input_masks_label, input_segments_label, doc_id, mask_positions
+            reply_relations, reply_parents, topology_graphs, input_ids_label, input_masks_label, input_segments_label, doc_id, mask_positions,
+            knowledge_ids, knowledge_masks, knowledge_segments,
         ) = zip(*batch)
         dialogue_length = list(map(len, input_ids))
         st = 0
@@ -568,6 +624,16 @@ class DataProcessor():
         max_lens_label = max(len(w) for sublist in input_ids_label for w in sublist)
         padding_label = lambda input_batch: [w + [0] * (max_lens_label - len(w)) for sublist in input_ids_label for w in sublist]
         input_ids_label, input_masks_label, input_segments_label = map(padding_label, [input_ids_label, input_masks_label, input_segments_label])
+        max_knowledge_lens = max((len(w[0]) for w in knowledge_ids if w and w[0]), default=0)
+        if max_knowledge_lens > 0:
+            pad_knowledge = lambda batch: [w[0] + [0] * (max_knowledge_lens - len(w[0])) for w in batch]
+            knowledge_ids = pad_knowledge(knowledge_ids)
+            knowledge_masks = [[1] * max_knowledge_lens for _ in knowledge_ids]
+            knowledge_segments = [[0] * max_knowledge_lens for _ in knowledge_ids]
+        else:
+            knowledge_ids = [[0]]
+            knowledge_masks = [[0]]
+            knowledge_segments = [[0]]
         res = {
             "input_ids": torch.tensor(input_ids).to(self.config.device),
             "input_masks": torch.tensor(input_masks).to(self.config.device),
@@ -585,7 +651,10 @@ class DataProcessor():
             "input_masks_label": torch.tensor(input_masks_label).to(self.config.device),
             "input_segments_label": torch.tensor(input_segments_label).to(self.config.device),
             "doc_id": doc_id,
-            "mask_positions": mask_positions
+            "mask_positions": mask_positions,
+            "knowledge_input_ids": torch.tensor(knowledge_ids).to(self.config.device),
+            "knowledge_input_masks": torch.tensor(knowledge_masks).to(self.config.device),
+            "knowledge_input_segments": torch.tensor(knowledge_segments).to(self.config.device),
         }
         return res
 

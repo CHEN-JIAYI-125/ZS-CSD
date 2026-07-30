@@ -397,7 +397,7 @@ class TwoChannelTopologyEncoder(nn.Module):
     """
     Dual-channel propagation with independent sigmoid gates.
 
-    Gates init at sigmoid(-2) ~ 0.12 so the model starts close to SSE-only.
+    gate_init=0 → sigmoid(0)=0.5 (equal start). Use config topology_gate_init.
     """
 
     def __init__(self, hidden_dim, dropout=0.2, gate_init=-2.0):
