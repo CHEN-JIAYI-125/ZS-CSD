@@ -292,6 +292,38 @@ class DataProcessor():
             return tokens.index('[MASK]')
         raise ValueError('Cannot find [MASK] token in tokenized sentence')
 
+    @staticmethod
+    def _truncate_tokens_keep_mask(tokens, max_seq_length, mask_token='[MASK]'):
+        """Truncate long sequences without dropping the [MASK] prediction token."""
+        if max_seq_length <= 0 or len(tokens) <= max_seq_length:
+            return tokens
+
+        mask_aliases = {mask_token, '[MASK]'}
+        mask_idx = next((i for i, tok in enumerate(tokens) if tok in mask_aliases), None)
+        if mask_idx is None:
+            return tokens[: max_seq_length - 1] + ['[SEP]']
+
+        suffix = tokens[mask_idx:]
+        prefix = tokens[:mask_idx]
+        budget = max_seq_length - len(suffix)
+        if budget <= 0:
+            return suffix[:max_seq_length]
+        if len(prefix) <= budget:
+            return prefix + suffix
+
+        # Keep [CLS] + utterance head + template tail (target / 立场为) before [MASK].
+        keep_head = min(8, budget // 2, len(prefix))
+        keep_tail = min(budget - keep_head, 24, len(prefix) - keep_head)
+        if keep_tail <= 0:
+            return prefix[:budget] + suffix
+
+        head = prefix[:keep_head]
+        tail = prefix[-keep_tail:]
+        merged = head + tail
+        if len(merged) > budget:
+            merged = merged[:budget]
+        return merged + suffix
+
     def _is_question(self, text, question_cues):
         text = str(text)
         if '?' in text or '？' in text:
@@ -540,7 +572,8 @@ class DataProcessor():
             tokens = self.tokenizer.tokenize(new_sen)
             max_seq_length = int(getattr(self.config, 'max_seq_length', 0))
             if max_seq_length > 0 and len(tokens) > max_seq_length:
-                tokens = tokens[:max_seq_length - 1] + ['[SEP]']
+                mask_tok = self.tokenizer.mask_token or '[MASK]'
+                tokens = self._truncate_tokens_keep_mask(tokens, max_seq_length, mask_token=mask_tok)
             new_sentences.append(tokens)
             mask_positions.append(self.get_mask_position(tokens))
             sep_indices = [i for i, token in enumerate(tokens) if token == '[SEP]']
