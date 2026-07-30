@@ -66,37 +66,41 @@ class SITCL(nn.Module):
         self.alpha = config.alpha
         self.use_topology = bool(getattr(config, 'use_topology', 1))
         self.use_knowledge_gate = bool(getattr(config, 'use_knowledge_gate', 1))
-        self.last_topology_gates = None
-        self.last_knowledge_gate = None
+        hidden = config.gru_hidden
         self.bert = AutoModel.from_pretrained(config.bert_dir)
-        self.gru = nn.GRU(input_size=768, hidden_size=config.gru_hidden, num_layers=config.gru_layer, batch_first=True)
-        self.fc = nn.Linear(config.gru_hidden, config.num_classes)
+        self.gru = nn.GRU(input_size=768, hidden_size=hidden, num_layers=config.gru_layer, batch_first=True)
 
         label_smoothing = float(getattr(config, 'label_smoothing', 0.05))
         class_weight = self._build_class_weights(config)
         self.criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=label_smoothing)
 
-        self.SSE = SSE(hidden_dim=config.gru_hidden)
+        self.SSE = SSE(hidden_dim=hidden)
+        self.sem_norm = nn.LayerNorm(hidden)
+
+        fusion_dim = hidden
         if self.use_topology:
             dropout = float(getattr(config, 'topology_dropout', 0.2))
             gate_init = float(getattr(config, 'topology_gate_init', -2.0))
             self.topology_encoder = TwoChannelTopologyEncoder(
-                config.gru_hidden,
+                hidden,
                 dropout=dropout,
                 gate_init=gate_init,
             )
-            self.fusion_gate = nn.Linear(config.gru_hidden * 2, config.gru_hidden)
-            fusion_init = float(getattr(config, 'topology_fusion_gate_init', -1.0))
-            nn.init.zeros_(self.fusion_gate.weight)
-            nn.init.constant_(self.fusion_gate.bias, fusion_init)
+            self.topo_norm = nn.LayerNorm(hidden)
+            fusion_dim += hidden
+        else:
+            self.topology_encoder = None
+            self.topo_norm = None
 
         if self.use_knowledge_gate:
-            self.knowledge_gate = nn.Linear(config.gru_hidden * 2, config.gru_hidden)
-            kg_init = float(getattr(config, 'knowledge_gate_init', 2.0))
-            nn.init.zeros_(self.knowledge_gate.weight)
-            nn.init.constant_(self.knowledge_gate.bias, kg_init)
+            self.know_norm = nn.LayerNorm(768)
+            self.knowledge_proj = nn.Linear(768, hidden)
+            fusion_dim += hidden
         else:
-            self.knowledge_gate = None
+            self.know_norm = None
+            self.knowledge_proj = None
+
+        self.fc = nn.Linear(fusion_dim, config.num_classes)
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -107,12 +111,6 @@ class SITCL(nn.Module):
         weights = 1.0 / torch.sqrt(torch.tensor(counts, dtype=torch.float))
         weights = weights / weights.mean()
         return weights.to(config.device)
-
-    def get_knowledge_gate(self):
-        if self.knowledge_gate is None or self.last_knowledge_gate is None:
-            return None
-        with torch.no_grad():
-            return float(self.last_knowledge_gate.detach().cpu().mean().item())
 
     def _encode_knowledge(self, knowledge_input_ids, knowledge_input_masks, knowledge_input_segments):
         if knowledge_input_ids is None or knowledge_input_masks is None:
@@ -126,16 +124,11 @@ class SITCL(nn.Module):
         ).last_hidden_state
         return know_out[:, 0, :]
 
-    def _fuse_knowledge(self, h_text, h_know):
-        gate = torch.sigmoid(self.knowledge_gate(torch.cat([h_text, h_know], dim=-1)))
-        self.last_knowledge_gate = gate.mean()
-        return gate * h_text + (1.0 - gate) * h_know
+    def _concat_features(self, parts):
+        return torch.cat(parts, dim=-1)
 
     def get_topology_gates(self):
-        if not self.use_topology or self.topology_encoder is None:
-            return None
-        with torch.no_grad():
-            return self.topology_encoder.channel_weights().detach().cpu().tolist()
+        return None
 
     def _extract_utterance_hidden(self, out, st, ed, mask_positions, dia_id):
         if mask_positions is not None:
@@ -171,29 +164,26 @@ class SITCL(nn.Module):
             v = self.SSE(o, speakers[dia_id])
             h_sem = v[-1]
 
+            parts = [self.sem_norm(h_sem)]
+
             if self.use_topology and topology_graphs is not None:
                 topology_v = self.topology_encoder(v, topology_graphs[dia_id])
-                topology_final = topology_v[-1]
-                gate = torch.sigmoid(self.fusion_gate(torch.cat([h_sem, topology_final], dim=-1)))
-                final_state = gate * topology_final + (1.0 - gate) * h_sem
-            else:
-                final_state = h_sem
+                parts.append(self.topo_norm(topology_v[-1]))
 
             if (
                 self.use_knowledge_gate
-                and self.knowledge_gate is not None
                 and h_know_all is not None
                 and h_know_all.size(0) > dia_id
+                and knowledge_input_masks is not None
+                and knowledge_input_masks[dia_id].sum().item() > 0
             ):
-                h_know = h_know_all[dia_id]
-                if knowledge_input_masks is not None and knowledge_input_masks[dia_id].sum().item() > 0:
-                    final_state = self._fuse_knowledge(final_state, h_know)
+                h_know = self.knowledge_proj(self.know_norm(h_know_all[dia_id]))
+                parts.append(h_know)
+
+            final_state = self._concat_features(parts)
 
             H_final.append(v)
             stance.append(final_state)
-
-        if self.use_topology and self.topology_encoder is not None:
-            self.last_topology_gates = self.get_topology_gates()
 
         stance = torch.stack(stance)
         logits = self.fc(stance)

@@ -395,25 +395,24 @@ def build_group_adjacency(graph, num_nodes, group_id, device, dtype):
 
 class TwoChannelTopologyEncoder(nn.Module):
     """
-    Dual-channel propagation with independent sigmoid gates.
-
-    gate_init=0 → sigmoid(0)=0.5 (equal start). Use config topology_gate_init.
+    Dual-channel propagation: normalize context / speaker messages, then concat and project.
+    No gated residual addition.
     """
 
     def __init__(self, hidden_dim, dropout=0.2, gate_init=-2.0):
         super().__init__()
+        _ = gate_init  # kept for config compatibility
         self.context_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.speaker_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.context_gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
-        self.speaker_gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+        self.node_norm = nn.LayerNorm(hidden_dim)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.speaker_norm = nn.LayerNorm(hidden_dim)
+        self.channel_merge = nn.Linear(hidden_dim * 3, hidden_dim)
         self.message_dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def channel_weights(self):
-        return torch.stack([
-            torch.sigmoid(self.context_gate_logit),
-            torch.sigmoid(self.speaker_gate_logit),
-        ])
+        return None
 
     def forward(self, nodes, graph):
         num_nodes = nodes.size(0)
@@ -429,6 +428,9 @@ class TwoChannelTopologyEncoder(nn.Module):
         context_message = self.message_dropout(context_message)
         speaker_message = self.message_dropout(speaker_message)
 
-        gates = self.channel_weights()
-        output = nodes + gates[0] * context_message + gates[1] * speaker_message
-        return self.norm(output)
+        merged = torch.cat([
+            self.node_norm(nodes),
+            self.context_norm(context_message),
+            self.speaker_norm(speaker_message),
+        ], dim=-1)
+        return self.norm(self.channel_merge(merged))

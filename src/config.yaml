@@ -22,8 +22,6 @@ use_topology: 1
 speaker_history_k: 1
 edge_time_decay: 0.3
 topology_dropout: 0.2
-topology_gate_init: 0.0  # sigmoid(0)=0.5; was -2.0 (~0.12) which suppressed topology
-topology_fusion_gate_init: -1.0  # per-dim fusion prefers SSE/text at start; topology can grow
 label_smoothing: 0.05
 alpha: 0.1  # enable target contrastive; was 0 (disabled)
 
@@ -57,7 +55,6 @@ require_target_knowledge: 0
 target_knowledge_path: data/target_knowledge_template.json
 target_knowledge_max_chars: 64
 knowledge_stance_only: 1  # only favor/against reasons, skip background description
-use_knowledge_gate: 1  # encode knowledge separately + learnable gate (not concat in prompt)
-knowledge_gate_init: 2.0  # sigmoid(2)~0.88 → text path dominant at start
+use_knowledge_gate: 1  # encode knowledge separately, norm + concat (not in prompt)
 max_seq_length: 256
 max_knowledge_seq_length: 48
