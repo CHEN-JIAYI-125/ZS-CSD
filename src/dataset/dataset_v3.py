@@ -88,6 +88,7 @@ class DataProcessor():
         self.config = config
         self.use_target_knowledge = bool(getattr(config, 'use_target_knowledge', 1))
         self.target_knowledge = self.load_target_knowledge()
+        self.target_knowledge_fields = self.load_target_knowledge_fields()
         self._log_and_validate_target_knowledge()
 
     @staticmethod
@@ -228,6 +229,61 @@ class DataProcessor():
                 empty_targets[:5],
             )
         return knowledge
+
+    def load_target_knowledge_fields(self):
+        if not self.use_target_knowledge:
+            return {}
+
+        path = getattr(self.config, 'target_knowledge_path', '')
+        if not path or not os.path.exists(path):
+            return {}
+
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+
+        fields_by_target = {}
+        max_side = int(getattr(self.config, 'target_knowledge_max_chars', 64))
+        for target, value in raw.items():
+            if isinstance(value, str):
+                fields_by_target[str(target)] = {
+                    'description': self._truncate_field(value, max_side),
+                    'favor_reason': '',
+                    'against_reason': '',
+                }
+                continue
+            if not isinstance(value, dict):
+                continue
+            fields = self.normalize_model_entry(value)
+            fields_by_target[str(target)] = {
+                'description': self._truncate_field(fields.get('description', ''), max_side),
+                'favor_reason': self._truncate_field(fields.get('favor_reason', ''), max_side),
+                'against_reason': self._truncate_field(fields.get('against_reason', ''), max_side),
+            }
+        return fields_by_target
+
+    def get_knowledge_stance_texts(self, dialogue):
+        target = str(dialogue['target'])
+        if not self.use_target_knowledge:
+            return '', '', ''
+
+        fields = self.target_knowledge_fields.get(target, {})
+        favor = fields.get('favor_reason', '')
+        against = fields.get('against_reason', '')
+        neutral = fields.get('description', '')
+        if not any([favor, against, neutral]):
+            fallback = self.target_knowledge.get(target, f'target={target}')
+            return fallback, fallback, fallback
+        return favor, against, neutral
+
+    @classmethod
+    def _tokenize_knowledge_side(cls, tokenizer, target, text, side_label, max_len):
+        if not str(text).strip():
+            return []
+        know_text = f'[CLS]关于[SEP]{target}[SEP]{side_label}：{text}[SEP]'
+        tokens = tokenizer.tokenize(know_text)
+        if max_len > 0 and len(tokens) > max_len:
+            tokens = tokens[: max_len - 1] + ['[SEP]']
+        return tokens
 
     def collect_dataset_targets(self):
         targets = set()
@@ -416,10 +472,9 @@ class DataProcessor():
         return EDGE_TYPE_WEIGHTS.get(edge_type, 1.0)
 
     def build_topology_graph(self, speakers, reply_relations, reply_parents, reply_confidences=None, local_window=3):
-        """Build utterance graph with edge_group for dual-channel propagation."""
+        """Build utterance graph: context edges + speaker_ids for hypergraph channel."""
         speaker_ids = [int(speaker) for speaker in speakers]
         num_turns = len(speaker_ids)
-        speaker_history_k = int(getattr(self.config, 'speaker_history_k', 1))
         edge_time_decay = float(getattr(self.config, 'edge_time_decay', 0.3))
 
         edge_src = []
@@ -428,7 +483,6 @@ class DataProcessor():
         edge_groups = []
         edge_weights = []
         added_pairs = set()
-        history_by_speaker = {}
 
         def decay_weight(src, dst, base=1.0):
             distance = max(dst - src, 0)
@@ -468,12 +522,8 @@ class DataProcessor():
             if 0 <= parent < turn_id:
                 relation = reply_relations[turn_id] if turn_id < len(reply_relations) else RELATION_CROSS_REPLY
                 same_speaker_parent = speaker_ids[parent] == speaker
-                if same_speaker_parent:
-                    edge_type = EDGE_SAME_SPEAKER
-                    edge_group = EDGE_GROUP_SPEAKER_HISTORY
-                else:
-                    edge_type = self.reply_relation_to_edge_type(relation, False)
-                    edge_group = EDGE_GROUP_CONTEXT
+                edge_type = EDGE_SAME_SPEAKER if same_speaker_parent else self.reply_relation_to_edge_type(relation, False)
+                edge_group = EDGE_GROUP_CONTEXT
                 add_edge(
                     parent,
                     turn_id,
@@ -481,17 +531,6 @@ class DataProcessor():
                     edge_group,
                     decay_weight(parent, turn_id, base=confidence),
                 )
-
-            history = history_by_speaker.get(speaker, [])
-            for prev_turn in history[-speaker_history_k:]:
-                add_edge(
-                    prev_turn,
-                    turn_id,
-                    EDGE_SAME_SPEAKER,
-                    EDGE_GROUP_SPEAKER_HISTORY,
-                    decay_weight(prev_turn, turn_id),
-                )
-            history_by_speaker.setdefault(speaker, []).append(turn_id)
 
         assert len(edge_types) == len(edge_groups) == len(edge_weights), 'edge metadata length mismatch'
 
@@ -503,6 +542,7 @@ class DataProcessor():
             'edge_types': edge_types,
             'edge_group': edge_groups,
             'edge_weight': edge_weights,
+            'speaker_ids_for_turn': speaker_ids,
             'reply_parent': list(reply_parents),
             'reply_relation': list(reply_relations),
             'reply_confidence': list(reply_confidences) if reply_confidences is not None else [1.0] * num_turns,
@@ -516,6 +556,7 @@ class DataProcessor():
             edge_type=torch.tensor(edge_types, dtype=torch.long),
             edge_group=torch.tensor(edge_groups, dtype=torch.long),
             edge_weight=torch.tensor(edge_weights, dtype=torch.float),
+            speaker_ids_for_turn=torch.tensor(speaker_ids, dtype=torch.long),
         )
 
     def read_data(self, mode):
@@ -542,7 +583,9 @@ class DataProcessor():
         reply_confidences = []
         target = dialogue["target"]
         knowledge = self.get_knowledge_text(dialogue)
-        use_knowledge_gate = bool(getattr(self.config, 'use_knowledge_gate', 1))
+        use_stance_knowledge = bool(getattr(self.config, 'use_knowledge_stance_attention', 1))
+        use_knowledge_gate = bool(getattr(self.config, 'use_knowledge_gate', 0))
+        knowledge_separate = use_stance_knowledge or use_knowledge_gate
         speakers = dialogue["speakers"]
         raw_sentences = list(dialogue['sentences'])
         local_window = int(getattr(self.config, 'topology_local_window', 3))
@@ -555,13 +598,13 @@ class DataProcessor():
             reply_confidences.append(confidence)
             new_sen = (
                 f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为[MASK][SEP]'
-                if use_knowledge_gate
+                if knowledge_separate
                 else f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为[MASK]。目标说明：{knowledge}[SEP]'
             )
             if id == len(dialogue['sentences']) - 1:
                 label_sen = (
                     f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为{dialogue["label"]}[SEP]'
-                    if use_knowledge_gate
+                    if knowledge_separate
                     else f'[CLS]在话语“{sen}”中，用户{speakers[id]}对[SEP]{target}[SEP]的立场为{dialogue["label"]}。目标说明：{knowledge}[SEP]'
                 )
                 label_sen_token = self.tokenizer.tokenize(label_sen)
@@ -589,24 +632,32 @@ class DataProcessor():
             local_window=local_window,
         )
         dialogue['mask_positions'] = mask_positions
-        if use_knowledge_gate and self.use_target_knowledge:
-            know_text = f'[CLS]关于[SEP]{target}[SEP]：{knowledge}[SEP]'
-            know_tokens = self.tokenizer.tokenize(know_text)
-            max_knowledge_len = int(getattr(self.config, 'max_knowledge_seq_length', 48))
-            if max_knowledge_len > 0 and len(know_tokens) > max_knowledge_len:
-                know_tokens = know_tokens[:max_knowledge_len - 1] + ['[SEP]']
-            dialogue['knowledge_tokens'] = know_tokens
+        max_knowledge_len = int(getattr(self.config, 'max_knowledge_seq_length', 48))
+        if bool(getattr(self.config, 'use_knowledge_stance_attention', 1)) and self.use_target_knowledge:
+            favor, against, neutral = self.get_knowledge_stance_texts(dialogue)
+            dialogue['knowledge_favor_tokens'] = self._tokenize_knowledge_side(
+                self.tokenizer, target, favor, '可能支持', max_knowledge_len,
+            )
+            dialogue['knowledge_against_tokens'] = self._tokenize_knowledge_side(
+                self.tokenizer, target, against, '可能反对', max_knowledge_len,
+            )
+            dialogue['knowledge_neutral_tokens'] = self._tokenize_knowledge_side(
+                self.tokenizer, target, neutral, '背景说明', max_knowledge_len,
+            )
         else:
-            dialogue['knowledge_tokens'] = []
+            dialogue['knowledge_favor_tokens'] = []
+            dialogue['knowledge_against_tokens'] = []
+            dialogue['knowledge_neutral_tokens'] = []
         return dialogue
 
     def transform2indices(self, data):
         res = []
         for document in data:
-            sentences, speakers, label, target_idx, target, label_sen, doc_id, reply_relations, reply_parents, topology_graph, mask_positions, knowledge_tokens = [
+            sentences, speakers, label, target_idx, target, label_sen, doc_id, reply_relations, reply_parents, topology_graph, mask_positions, knowledge_favor_tokens, knowledge_against_tokens, knowledge_neutral_tokens = [
                 document[w] for w in [
                     'sentences', 'speakers', 'label', 'target_idx', 'target', 'label_sen',
-                    'id', 'reply_relations', 'reply_parents', 'topology_graph', 'mask_positions', 'knowledge_tokens'
+                    'id', 'reply_relations', 'reply_parents', 'topology_graph', 'mask_positions',
+                    'knowledge_favor_tokens', 'knowledge_against_tokens', 'knowledge_neutral_tokens',
                 ]
             ]
             all_label = document.get('all_label', [label] * len(sentences))
@@ -618,16 +669,22 @@ class DataProcessor():
             input_ids_label = list(map(self.tokenizer.convert_tokens_to_ids, label_sen))
             input_masks_label = [[1] * len(w) for w in input_ids_label]
             input_segments_label = [[0] * len(w) for w in input_ids_label]
-            if knowledge_tokens:
-                knowledge_ids = [self.tokenizer.convert_tokens_to_ids(knowledge_tokens)]
-                knowledge_masks = [[1] * len(knowledge_ids[0])]
-                knowledge_segments = [[0] * len(knowledge_ids[0])]
-            else:
-                knowledge_ids, knowledge_masks, knowledge_segments = [[]], [[]], [[]]
+            def encode_side(tokens):
+                if tokens:
+                    ids = self.tokenizer.convert_tokens_to_ids(tokens)
+                    return [ids], [[1] * len(ids)]], [[0] * len(ids)]]
+                return [[]], [[]], [[]]
+
+            favor_ids, favor_masks, favor_segments = encode_side(knowledge_favor_tokens)
+            against_ids, against_masks, against_segments = encode_side(knowledge_against_tokens)
+            neutral_ids, neutral_masks, neutral_segments = encode_side(knowledge_neutral_tokens)
+
             res.append((
                 input_ids, input_masks, input_segments, speakers, label, all_label, target_idx, target,
                 reply_relations, reply_parents, topology_graph, input_ids_label, input_masks_label, input_segments_label, doc_id, mask_positions,
-                knowledge_ids, knowledge_masks, knowledge_segments,
+                favor_ids, favor_masks, favor_segments,
+                against_ids, against_masks, against_segments,
+                neutral_ids, neutral_masks, neutral_segments,
             ))
         return res
 
@@ -640,7 +697,9 @@ class DataProcessor():
         (
             input_ids, input_masks, input_segments, speakers, label, all_label, target_idx, target,
             reply_relations, reply_parents, topology_graphs, input_ids_label, input_masks_label, input_segments_label, doc_id, mask_positions,
-            knowledge_ids, knowledge_masks, knowledge_segments,
+            knowledge_favor_ids, knowledge_favor_masks, knowledge_favor_segments,
+            knowledge_against_ids, knowledge_against_masks, knowledge_against_segments,
+            knowledge_neutral_ids, knowledge_neutral_masks, knowledge_neutral_segments,
         ) = zip(*batch)
         dialogue_length = list(map(len, input_ids))
         st = 0
@@ -654,16 +713,24 @@ class DataProcessor():
         max_lens_label = max(len(w) for sublist in input_ids_label for w in sublist)
         padding_label = lambda input_batch: [w + [0] * (max_lens_label - len(w)) for sublist in input_ids_label for w in sublist]
         input_ids_label, input_masks_label, input_segments_label = map(padding_label, [input_ids_label, input_masks_label, input_segments_label])
-        max_knowledge_lens = max((len(w[0]) for w in knowledge_ids if w and w[0]), default=0)
-        if max_knowledge_lens > 0:
-            pad_knowledge = lambda batch: [w[0] + [0] * (max_knowledge_lens - len(w[0])) for w in batch]
-            knowledge_ids = pad_knowledge(knowledge_ids)
-            knowledge_masks = [[1] * max_knowledge_lens for _ in knowledge_ids]
-            knowledge_segments = [[0] * max_knowledge_lens for _ in knowledge_ids]
-        else:
-            knowledge_ids = [[0]]
-            knowledge_masks = [[0]]
-            knowledge_segments = [[0]]
+        def pad_knowledge_batch(batch):
+            max_len = max((len(w[0]) for w in batch if w and w[0]), default=0)
+            batch_size = len(batch)
+            if max_len <= 0:
+                return [[0] for _ in range(batch_size)], [[0] for _ in range(batch_size)], [[0] for _ in range(batch_size)]
+            ids, masks, segments = [], [], []
+            for w in batch:
+                seq = w[0] if w and w[0] else []
+                pad_len = max_len - len(seq)
+                ids.append(seq + [0] * pad_len)
+                masks.append([1] * len(seq) + [0] * pad_len)
+                segments.append([0] * max_len)
+            return ids, masks, segments
+
+        knowledge_favor_ids, knowledge_favor_masks, knowledge_favor_segments = pad_knowledge_batch(knowledge_favor_ids)
+        knowledge_against_ids, knowledge_against_masks, knowledge_against_segments = pad_knowledge_batch(knowledge_against_ids)
+        knowledge_neutral_ids, knowledge_neutral_masks, knowledge_neutral_segments = pad_knowledge_batch(knowledge_neutral_ids)
+
         res = {
             "input_ids": torch.tensor(input_ids).to(self.config.device),
             "input_masks": torch.tensor(input_masks).to(self.config.device),
@@ -682,9 +749,15 @@ class DataProcessor():
             "input_segments_label": torch.tensor(input_segments_label).to(self.config.device),
             "doc_id": doc_id,
             "mask_positions": mask_positions,
-            "knowledge_input_ids": torch.tensor(knowledge_ids).to(self.config.device),
-            "knowledge_input_masks": torch.tensor(knowledge_masks).to(self.config.device),
-            "knowledge_input_segments": torch.tensor(knowledge_segments).to(self.config.device),
+            "knowledge_favor_input_ids": torch.tensor(knowledge_favor_ids).to(self.config.device),
+            "knowledge_favor_input_masks": torch.tensor(knowledge_favor_masks).to(self.config.device),
+            "knowledge_favor_input_segments": torch.tensor(knowledge_favor_segments).to(self.config.device),
+            "knowledge_against_input_ids": torch.tensor(knowledge_against_ids).to(self.config.device),
+            "knowledge_against_input_masks": torch.tensor(knowledge_against_masks).to(self.config.device),
+            "knowledge_against_input_segments": torch.tensor(knowledge_against_segments).to(self.config.device),
+            "knowledge_neutral_input_ids": torch.tensor(knowledge_neutral_ids).to(self.config.device),
+            "knowledge_neutral_input_masks": torch.tensor(knowledge_neutral_masks).to(self.config.device),
+            "knowledge_neutral_input_segments": torch.tensor(knowledge_neutral_segments).to(self.config.device),
         }
         return res
 

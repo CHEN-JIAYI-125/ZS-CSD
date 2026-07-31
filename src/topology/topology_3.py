@@ -393,17 +393,60 @@ def build_group_adjacency(graph, num_nodes, group_id, device, dtype):
     return adj
 
 
+class SpeakerHypergraphChannel(nn.Module):
+    """
+    Speaker-dimension hyperedges: for each turn, pool all same-speaker
+    historical utterances (j <= i) with target-aware attention.
+    """
+
+    def __init__(self, hidden_dim, dropout=0.2):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = hidden_dim ** -0.5
+
+    def forward(self, nodes, speaker_ids_for_turn):
+        num_nodes = nodes.size(0)
+        device = nodes.device
+        encoded = F.gelu(self.linear(nodes))
+        encoded = self.dropout(encoded)
+
+        if speaker_ids_for_turn is None:
+            return encoded
+
+        speaker_ids = speaker_ids_for_turn.to(device).long().view(-1)
+        if speaker_ids.numel() != num_nodes:
+            return encoded
+
+        messages = []
+        for turn_id in range(num_nodes):
+            spk = speaker_ids[turn_id]
+            hist_mask = (speaker_ids == spk) & (
+                torch.arange(num_nodes, device=device) <= turn_id
+            )
+            hist_idx = hist_mask.nonzero(as_tuple=False).view(-1)
+            if hist_idx.numel() == 0:
+                messages.append(encoded[turn_id])
+                continue
+            hist = encoded[hist_idx]
+            query = encoded[turn_id:turn_id + 1]
+            scores = torch.matmul(query, hist.transpose(0, 1)) * self.scale
+            weights = torch.softmax(scores, dim=-1)
+            messages.append(torch.matmul(weights, hist).squeeze(0))
+        return torch.stack(messages)
+
+
 class TwoChannelTopologyEncoder(nn.Module):
     """
-    Dual-channel propagation: normalize context / speaker messages, then concat and project.
-    No gated residual addition.
+    Dual-channel: context graph propagation + speaker hypergraph (replaces speaker-history edges).
+    Normalize each branch, concat with node state, project back to hidden_dim.
     """
 
     def __init__(self, hidden_dim, dropout=0.2, gate_init=-2.0):
         super().__init__()
-        _ = gate_init  # kept for config compatibility
+        _ = gate_init
         self.context_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.speaker_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
         self.node_norm = nn.LayerNorm(hidden_dim)
         self.context_norm = nn.LayerNorm(hidden_dim)
         self.speaker_norm = nn.LayerNorm(hidden_dim)
@@ -420,13 +463,11 @@ class TwoChannelTopologyEncoder(nn.Module):
         dtype = nodes.dtype
 
         adj_context = build_group_adjacency(graph, num_nodes, EDGE_GROUP_CONTEXT, device, dtype)
-        adj_speaker = build_group_adjacency(graph, num_nodes, EDGE_GROUP_SPEAKER_HISTORY, device, dtype)
-
         context_message = F.gelu(torch.matmul(adj_context, self.context_linear(nodes)))
-        speaker_message = F.gelu(torch.matmul(adj_speaker, self.speaker_linear(nodes)))
-
         context_message = self.message_dropout(context_message)
-        speaker_message = self.message_dropout(speaker_message)
+
+        speaker_ids = _graph_tensor(graph, 'speaker_ids_for_turn')
+        speaker_message = self.speaker_hypergraph(nodes, speaker_ids)
 
         merged = torch.cat([
             self.node_norm(nodes),

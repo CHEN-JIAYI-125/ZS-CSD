@@ -59,13 +59,42 @@ class SSE(nn.Module):
         return torch.stack(V_lst)
 
 
+class StanceKnowledgeAttention(nn.Module):
+    """Attend from current utterance to favor / against / neutral knowledge sides."""
+
+    def __init__(self, hidden_dim, bert_dim=768, dropout=0.1):
+        super().__init__()
+        self.know_norm = nn.LayerNorm(bert_dim)
+        self.query_proj = nn.Linear(hidden_dim, bert_dim)
+        self.key_proj = nn.Linear(bert_dim, bert_dim, bias=False)
+        self.value_proj = nn.Linear(bert_dim, bert_dim, bias=False)
+        self.out_proj = nn.Linear(bert_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = bert_dim ** -0.5
+
+    def forward(self, h_sem, h_favor, h_against, h_neutral, valid_mask=None):
+        stance_keys = torch.stack([h_favor, h_against, h_neutral], dim=0)
+        keys = self.key_proj(self.know_norm(stance_keys))
+        values = self.value_proj(self.know_norm(stance_keys))
+        query = self.query_proj(h_sem.unsqueeze(0))
+        scores = torch.matmul(query, keys.transpose(0, 1)) * self.scale
+        if valid_mask is not None:
+            scores = scores.masked_fill(~valid_mask.view(1, -1), float('-inf'))
+        weights = torch.softmax(scores, dim=-1)
+        attended = torch.matmul(weights, values).squeeze(0)
+        return self.out_proj(self.dropout(attended)), weights.squeeze(0)
+
+
 class SITCL(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.alpha = config.alpha
         self.use_topology = bool(getattr(config, 'use_topology', 1))
-        self.use_knowledge_gate = bool(getattr(config, 'use_knowledge_gate', 1))
+        self.use_knowledge_stance_attention = bool(
+            getattr(config, 'use_knowledge_stance_attention', 0)
+            or getattr(config, 'use_knowledge_gate', 0)
+        )
         hidden = config.gru_hidden
         self.bert = AutoModel.from_pretrained(config.bert_dir)
         self.gru = nn.GRU(input_size=768, hidden_size=hidden, num_layers=config.gru_layer, batch_first=True)
@@ -92,13 +121,12 @@ class SITCL(nn.Module):
             self.topology_encoder = None
             self.topo_norm = None
 
-        if self.use_knowledge_gate:
-            self.know_norm = nn.LayerNorm(768)
-            self.knowledge_proj = nn.Linear(768, hidden)
+        if self.use_knowledge_stance_attention:
+            dropout = float(getattr(config, 'knowledge_dropout', 0.1))
+            self.stance_knowledge_attn = StanceKnowledgeAttention(hidden, bert_dim=768, dropout=dropout)
             fusion_dim += hidden
         else:
-            self.know_norm = None
-            self.knowledge_proj = None
+            self.stance_knowledge_attn = None
 
         self.fc = nn.Linear(fusion_dim, config.num_classes)
 
@@ -112,15 +140,15 @@ class SITCL(nn.Module):
         weights = weights / weights.mean()
         return weights.to(config.device)
 
-    def _encode_knowledge(self, knowledge_input_ids, knowledge_input_masks, knowledge_input_segments):
-        if knowledge_input_ids is None or knowledge_input_masks is None:
+    def _encode_knowledge_batch(self, input_ids, input_masks, input_segments):
+        if input_ids is None or input_masks is None:
             return None
-        if knowledge_input_masks.sum().item() <= 0:
+        if input_masks.sum().item() <= 0:
             return None
         know_out = self.bert(
-            input_ids=knowledge_input_ids,
-            attention_mask=knowledge_input_masks,
-            token_type_ids=knowledge_input_segments,
+            input_ids=input_ids,
+            attention_mask=input_masks,
+            token_type_ids=input_segments,
         ).last_hidden_state
         return know_out[:, 0, :]
 
@@ -146,13 +174,25 @@ class SITCL(nn.Module):
         targets = kwargs['target']
         mask_positions = kwargs.get('mask_positions')
         topology_graphs = kwargs.get('topology_graphs')
-        knowledge_input_ids = kwargs.get('knowledge_input_ids')
-        knowledge_input_masks = kwargs.get('knowledge_input_masks')
-        knowledge_input_segments = kwargs.get('knowledge_input_segments')
+        knowledge_favor_input_ids = kwargs.get('knowledge_favor_input_ids')
+        knowledge_favor_input_masks = kwargs.get('knowledge_favor_input_masks')
+        knowledge_favor_input_segments = kwargs.get('knowledge_favor_input_segments')
+        knowledge_against_input_ids = kwargs.get('knowledge_against_input_ids')
+        knowledge_against_input_masks = kwargs.get('knowledge_against_input_masks')
+        knowledge_against_input_segments = kwargs.get('knowledge_against_input_segments')
+        knowledge_neutral_input_ids = kwargs.get('knowledge_neutral_input_ids')
+        knowledge_neutral_input_masks = kwargs.get('knowledge_neutral_input_masks')
+        knowledge_neutral_input_segments = kwargs.get('knowledge_neutral_input_segments')
 
         out = self.bert(input_ids=input_ids, attention_mask=input_masks, token_type_ids=input_segments).last_hidden_state
-        h_know_all = self._encode_knowledge(
-            knowledge_input_ids, knowledge_input_masks, knowledge_input_segments,
+        h_favor_all = self._encode_knowledge_batch(
+            knowledge_favor_input_ids, knowledge_favor_input_masks, knowledge_favor_input_segments,
+        )
+        h_against_all = self._encode_knowledge_batch(
+            knowledge_against_input_ids, knowledge_against_input_masks, knowledge_against_input_segments,
+        )
+        h_neutral_all = self._encode_knowledge_batch(
+            knowledge_neutral_input_ids, knowledge_neutral_input_masks, knowledge_neutral_input_segments,
         )
 
         H_final = []
@@ -170,15 +210,27 @@ class SITCL(nn.Module):
                 topology_v = self.topology_encoder(v, topology_graphs[dia_id])
                 parts.append(self.topo_norm(topology_v[-1]))
 
-            if (
-                self.use_knowledge_gate
-                and h_know_all is not None
-                and h_know_all.size(0) > dia_id
-                and knowledge_input_masks is not None
-                and knowledge_input_masks[dia_id].sum().item() > 0
-            ):
-                h_know = self.knowledge_proj(self.know_norm(h_know_all[dia_id]))
-                parts.append(h_know)
+            if self.use_knowledge_stance_attention and self.stance_knowledge_attn is not None:
+                if (
+                    h_favor_all is not None
+                    and h_against_all is not None
+                    and h_neutral_all is not None
+                    and dia_id < h_favor_all.size(0)
+                ):
+                    valid_mask = torch.tensor([
+                        knowledge_favor_input_masks[dia_id].sum().item() > 0,
+                        knowledge_against_input_masks[dia_id].sum().item() > 0,
+                        knowledge_neutral_input_masks[dia_id].sum().item() > 0,
+                    ], device=h_sem.device, dtype=torch.bool)
+                    if valid_mask.any():
+                        h_know, _ = self.stance_knowledge_attn(
+                            h_sem,
+                            h_favor_all[dia_id],
+                            h_against_all[dia_id],
+                            h_neutral_all[dia_id],
+                            valid_mask=valid_mask,
+                        )
+                        parts.append(h_know)
 
             final_state = self._concat_features(parts)
 
