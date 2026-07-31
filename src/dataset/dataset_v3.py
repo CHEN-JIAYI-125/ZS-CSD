@@ -62,7 +62,6 @@ MODEL_KNOWLEDGE_FIELDS = (
     'description',
     'favor_reason',
     'against_reason',
-    'neutral_hint',
 )
 
 class MyDataset(Dataset):
@@ -124,7 +123,6 @@ class DataProcessor():
             'description': description,
             'favor_reason': join_block(favor),
             'against_reason': join_block(against),
-            'neutral_hint': join_block(neutral, key='analysis_dimensions') or join_block(neutral),
         }
 
     @classmethod
@@ -164,7 +162,6 @@ class DataProcessor():
             ('description', '说明'),
             ('favor_reason', '可能支持'),
             ('against_reason', '可能反对'),
-            ('neutral_hint', '中性角度'),
         ]:
             raw = str(fields.get(key, '')).strip()
             if not raw:
