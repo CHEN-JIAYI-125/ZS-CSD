@@ -672,7 +672,7 @@ class DataProcessor():
             def encode_side(tokens):
                 if tokens:
                     ids = self.tokenizer.convert_tokens_to_ids(tokens)
-                    return [ids], [[1] * len(ids)]], [[0] * len(ids)]]
+                    return [ids], [[1] * len(ids)], [[0] * len(ids)]
                 return [[]], [[]], [[]]
 
             favor_ids, favor_masks, favor_segments = encode_side(knowledge_favor_tokens)
