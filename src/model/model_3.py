@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel
 import torch.nn.functional as F
-from src.common import map_sequence, target_CL
-from src.topology.topology_3 import TwoChannelTopologyEncoder
+from src.common import map_sequence
+from src.topology.topology_3 import ContextTopologyEncoder, SpeakerHypergraphChannel
 
 
 class Attention(nn.Module):
@@ -27,36 +27,35 @@ class Attention(nn.Module):
 
 
 class SSE(nn.Module):
-    def __init__(self, hidden_dim=768):
+    """Speaker-aware encoding: intra dialogue attention + speaker hypergraph inter."""
+
+    def __init__(self, hidden_dim=768, dropout=0.2):
         super().__init__()
         self.linear_intra = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.linear_inter = nn.Linear(hidden_dim, hidden_dim)
         self.attention_intra = Attention(hidden_dim)
-        self.attention_inter = Attention(hidden_dim)
+        self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
 
     def forward(self, utterances, speakers):
         device = utterances.device
-        speakers = torch.tensor(map_sequence(speakers), device=device)
-        V_lst = []
-        last_speaker_idx = dict()
-        for i in range(len(speakers)):
-            speaker_id = speakers[i].item()
+        speakers_mapped = map_sequence(speakers)
+        speaker_ids = torch.tensor(speakers_mapped, device=device)
+        inter_all = self.speaker_hypergraph(utterances, speaker_ids)
+
+        v_lst = []
+        last_speaker_idx = {}
+        for i in range(len(speakers_mapped)):
+            speaker_id = speakers_mapped[i]
             if speaker_id not in last_speaker_idx:
-                V_lst.append(utterances[i])
+                v_lst.append(utterances[i])
             else:
                 prev_idx = last_speaker_idx[speaker_id]
-                vh_concat = torch.cat((V_lst[prev_idx], utterances[i]), dim=-1)
+                vh_concat = torch.cat((v_lst[prev_idx], utterances[i]), dim=-1)
                 q_intra = self.linear_intra(vh_concat)
-                c = utterances[:i+1]
-                v_intra = self.attention_intra(q_intra, c, c)
-
-                q_inter = self.linear_inter(utterances[i])
-                k = torch.stack([V_lst[j] for j in range(prev_idx, i)]) if i > prev_idx else utterances[i].unsqueeze(0)
-                v_inter = self.attention_inter(q_inter, k, k) if len(k) > 0 else torch.zeros_like(q_inter)
-
-                V_lst.append(v_intra + v_inter)
+                context = utterances[: i + 1]
+                v_intra = self.attention_intra(q_intra, context, context)
+                v_lst.append(v_intra + inter_all[i])
             last_speaker_idx[speaker_id] = i
-        return torch.stack(V_lst)
+        return torch.stack(v_lst)
 
 
 class StanceKnowledgeAttention(nn.Module):
@@ -89,7 +88,6 @@ class SITCL(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.alpha = config.alpha
         self.use_topology = bool(getattr(config, 'use_topology', 1))
         self.use_knowledge_stance_attention = bool(
             getattr(config, 'use_knowledge_stance_attention', 0)
@@ -103,17 +101,16 @@ class SITCL(nn.Module):
         class_weight = self._build_class_weights(config)
         self.criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=label_smoothing)
 
-        self.SSE = SSE(hidden_dim=hidden)
+        dropout = float(getattr(config, 'sse_dropout', 0.2))
+        self.SSE = SSE(hidden_dim=hidden, dropout=dropout)
         self.sem_norm = nn.LayerNorm(hidden)
 
         fusion_dim = hidden
         if self.use_topology:
             dropout = float(getattr(config, 'topology_dropout', 0.2))
-            gate_init = float(getattr(config, 'topology_gate_init', -2.0))
-            self.topology_encoder = TwoChannelTopologyEncoder(
+            self.topology_encoder = ContextTopologyEncoder(
                 hidden,
                 dropout=dropout,
-                gate_init=gate_init,
             )
             self.topo_norm = nn.LayerNorm(hidden)
             fusion_dim += hidden
@@ -171,7 +168,6 @@ class SITCL(nn.Module):
         speakers = kwargs['speakers']
         label = kwargs['label']
         dia_idx = kwargs['dia_idx']
-        targets = kwargs['target']
         mask_positions = kwargs.get('mask_positions')
         topology_graphs = kwargs.get('topology_graphs')
         knowledge_favor_input_ids = kwargs.get('knowledge_favor_input_ids')
@@ -195,7 +191,6 @@ class SITCL(nn.Module):
             knowledge_neutral_input_ids, knowledge_neutral_input_masks, knowledge_neutral_input_segments,
         )
 
-        H_final = []
         stance = []
         for dia_id, (st, ed) in enumerate(dia_idx):
             h = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
@@ -233,13 +228,9 @@ class SITCL(nn.Module):
                         parts.append(h_know)
 
             final_state = self._concat_features(parts)
-
-            H_final.append(v)
             stance.append(final_state)
 
         stance = torch.stack(stance)
         logits = self.fc(stance)
-        ce_loss = self.criterion(logits, label)
-        target_contrastive_loss = target_CL(H_final, targets, self.config)
-        loss = ce_loss + self.alpha * target_contrastive_loss
+        loss = self.criterion(logits, label)
         return loss, logits, label

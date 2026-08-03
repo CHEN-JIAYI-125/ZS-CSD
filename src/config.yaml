@@ -17,13 +17,14 @@ gradient_accumulation_steps: 1
 adam_epsilon: 1e-8
 warmup_steps: 0
 
-# topology — dual-channel context / speaker-history
+# topology — context graph only (speaker hypergraph lives in SSE)
 use_topology: 1
 speaker_history_k: 1
 edge_time_decay: 0.3
 topology_dropout: 0.2
+sse_dropout: 0.2
 label_smoothing: 0.05
-alpha: 0.1  # enable target contrastive; was 0 (disabled)
+alpha: 0  # target_CL removed from model_3; kept for v0-v2 compatibility
 
 # episode hypergraph (v2): reply-chain + interaction events
 use_speaker_hypergraph: 1

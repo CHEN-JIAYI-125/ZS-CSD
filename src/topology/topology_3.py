@@ -334,7 +334,7 @@ def stance_relation_loss(utterances, labels, config):
 
 
 # ---------------------------------------------------------------------------
-# Dual-channel encoder (v3): context vs speaker-history propagation
+# Context topology encoder (v3): reply/next-turn graph; speaker handled in SSE hypergraph
 # ---------------------------------------------------------------------------
 
 EDGE_GROUP_CONTEXT = 0
@@ -436,21 +436,18 @@ class SpeakerHypergraphChannel(nn.Module):
         return torch.stack(messages)
 
 
-class TwoChannelTopologyEncoder(nn.Module):
+class ContextTopologyEncoder(nn.Module):
     """
-    Dual-channel: context graph propagation + speaker hypergraph (replaces speaker-history edges).
-    Normalize each branch, concat with node state, project back to hidden_dim.
+    Context graph propagation; speaker history is handled inside SSE hypergraph.
+    Normalize node + context message, concat, project back to hidden_dim.
     """
 
-    def __init__(self, hidden_dim, dropout=0.2, gate_init=-2.0):
+    def __init__(self, hidden_dim, dropout=0.2):
         super().__init__()
-        _ = gate_init
         self.context_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
         self.node_norm = nn.LayerNorm(hidden_dim)
         self.context_norm = nn.LayerNorm(hidden_dim)
-        self.speaker_norm = nn.LayerNorm(hidden_dim)
-        self.channel_merge = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.channel_merge = nn.Linear(hidden_dim * 2, hidden_dim)
         self.message_dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
 
@@ -466,12 +463,8 @@ class TwoChannelTopologyEncoder(nn.Module):
         context_message = F.gelu(torch.matmul(adj_context, self.context_linear(nodes)))
         context_message = self.message_dropout(context_message)
 
-        speaker_ids = _graph_tensor(graph, 'speaker_ids_for_turn')
-        speaker_message = self.speaker_hypergraph(nodes, speaker_ids)
-
         merged = torch.cat([
             self.node_norm(nodes),
             self.context_norm(context_message),
-            self.speaker_norm(speaker_message),
         ], dim=-1)
         return self.norm(self.channel_merge(merged))
