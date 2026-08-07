@@ -56,7 +56,9 @@ require_target_knowledge: 0
 target_knowledge_path: data/target_knowledge_template.json
 target_knowledge_max_chars: 64
 knowledge_stance_only: 0  # load description as neutral side for stance attention
-use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
-use_knowledge_gate: 0  # deprecated; kept for backward compat only
+# v4 — knowledge diff interaction (replaces v3 attention on favor/against/neutral)
+use_knowledge_diff_interaction: 1
+use_knowledge_stance_attention: 1  # legacy alias; enables knowledge path in model_4
+knowledge_dropout: 0.1
 max_seq_length: 256
 max_knowledge_seq_length: 48
