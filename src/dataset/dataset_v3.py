@@ -472,10 +472,18 @@ class DataProcessor():
         return EDGE_TYPE_WEIGHTS.get(edge_type, 1.0)
 
     def build_topology_graph(self, speakers, reply_relations, reply_parents, reply_confidences=None, local_window=3):
-        """Build utterance graph: context edges + speaker_ids for hypergraph channel."""
+        """Build utterance graph; optionally add GLAN speaker/target heterograph metadata."""
         speaker_ids = [int(speaker) for speaker in speakers]
         num_turns = len(speaker_ids)
         edge_time_decay = float(getattr(self.config, 'edge_time_decay', 0.3))
+        use_glan = bool(getattr(self.config, 'use_glan_topology', 0))
+
+        speaker_to_local = {}
+        glan_speaker_ids = []
+        for speaker in speaker_ids:
+            if speaker not in speaker_to_local:
+                speaker_to_local[speaker] = len(speaker_to_local)
+            glan_speaker_ids.append(speaker_to_local[speaker])
 
         edge_src = []
         edge_dst = []
@@ -488,11 +496,11 @@ class DataProcessor():
             distance = max(dst - src, 0)
             return float(base) * math.exp(-edge_time_decay * distance)
 
-        def add_edge(src, dst, edge_type, edge_group, weight=1.0):
+        def add_edge(src, dst, edge_type, edge_group, weight=1.0, allow_dup=False):
             if not (0 <= src < num_turns and 0 <= dst < num_turns):
                 return
             weight = float(weight) * self.edge_type_weight(edge_type)
-            if src != dst:
+            if src != dst and not allow_dup:
                 pair = (src, dst)
                 if pair in added_pairs:
                     return
@@ -532,32 +540,73 @@ class DataProcessor():
                     decay_weight(parent, turn_id, base=confidence),
                 )
 
+        num_speaker_nodes = len(speaker_to_local)
+        speaker_node_offset = num_turns
+        target_node = num_turns + num_speaker_nodes
+        num_nodes = num_turns
+        local_window_range = [max(0, num_turns - int(local_window)), num_turns]
+
+        if use_glan:
+            num_nodes = target_node + 1
+
+            def add_meta_edge(src, dst, edge_type, weight=1.0):
+                edge_src.append(src)
+                edge_dst.append(dst)
+                edge_types.append(edge_type)
+                edge_groups.append(EDGE_GROUP_AUXILIARY)
+                edge_weights.append(float(weight))
+
+            for turn_id, speaker in enumerate(speaker_ids):
+                speaker_node = speaker_node_offset + glan_speaker_ids[turn_id]
+                add_meta_edge(speaker_node, turn_id, EDGE_SPEAKER_TO_UTT, 1.0)
+                add_meta_edge(target_node, turn_id, EDGE_TARGET_TO_UTT, 1.0)
+                if turn_id == 0:
+                    add_meta_edge(target_node, turn_id, EDGE_ROOT_TO_UTT, 0.45)
+
         assert len(edge_types) == len(edge_groups) == len(edge_weights), 'edge metadata length mismatch'
 
         graph_values = {
             'num_utterance_nodes': num_turns,
-            'num_nodes': num_turns,
+            'num_nodes': num_nodes,
             'edge_index': [edge_src, edge_dst],
             'edge_type': edge_types,
             'edge_types': edge_types,
             'edge_group': edge_groups,
             'edge_weight': edge_weights,
-            'speaker_ids_for_turn': speaker_ids,
+            'speaker_ids_for_turn': glan_speaker_ids if use_glan else speaker_ids,
             'reply_parent': list(reply_parents),
             'reply_relation': list(reply_relations),
             'reply_confidence': list(reply_confidences) if reply_confidences is not None else [1.0] * num_turns,
+            'local_window': local_window_range,
         }
+        if use_glan:
+            graph_values.update({
+                'num_speaker_nodes': num_speaker_nodes,
+                'speaker_node_offset': speaker_node_offset,
+                'target_node': target_node,
+            })
         if PyGData is None:
             return graph_values
-        return PyGData(
-            num_nodes=num_turns,
-            num_utterance_nodes=torch.tensor([num_turns], dtype=torch.long),
-            edge_index=torch.tensor([edge_src, edge_dst], dtype=torch.long),
-            edge_type=torch.tensor(edge_types, dtype=torch.long),
-            edge_group=torch.tensor(edge_groups, dtype=torch.long),
-            edge_weight=torch.tensor(edge_weights, dtype=torch.float),
-            speaker_ids_for_turn=torch.tensor(speaker_ids, dtype=torch.long),
-        )
+        graph_kwargs = {
+            'num_nodes': num_nodes,
+            'num_utterance_nodes': torch.tensor([num_turns], dtype=torch.long),
+            'edge_index': torch.tensor([edge_src, edge_dst], dtype=torch.long),
+            'edge_type': torch.tensor(edge_types, dtype=torch.long),
+            'edge_group': torch.tensor(edge_groups, dtype=torch.long),
+            'edge_weight': torch.tensor(edge_weights, dtype=torch.float),
+            'speaker_ids_for_turn': torch.tensor(
+                glan_speaker_ids if use_glan else speaker_ids,
+                dtype=torch.long,
+            ),
+            'local_window': torch.tensor(local_window_range, dtype=torch.long),
+        }
+        if use_glan:
+            graph_kwargs.update({
+                'num_speaker_nodes': torch.tensor([num_speaker_nodes], dtype=torch.long),
+                'speaker_node_offset': torch.tensor([speaker_node_offset], dtype=torch.long),
+                'target_node': torch.tensor([target_node], dtype=torch.long),
+            })
+        return PyGData(**graph_kwargs)
 
     def read_data(self, mode):
         if mode == 'train':

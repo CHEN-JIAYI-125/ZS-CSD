@@ -148,7 +148,9 @@ class GLANStructuralBranch(nn.Module):
         edge_type = _graph_tensor(graph, 'edge_type')
         if edge_index is None or edge_index.numel() == 0:
             return node_features
-        edge_weight = _graph_tensor(graph, 'edge_weight')
+        device = node_features.device
+        edge_index = edge_index.to(device)
+        edge_type = edge_type.to(device)
         x = node_features
         x = torch.tanh(self.rgcn1(x, edge_index, edge_type))
         x = self.dropout(x)

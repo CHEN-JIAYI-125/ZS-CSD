@@ -1,9 +1,21 @@
+import logging
+
 import torch
 import torch.nn as nn
-from transformers import AutoModel
 import torch.nn.functional as F
+from transformers import AutoModel
+
 from src.common import map_sequence
-from src.topology.topology_3 import ContextTopologyEncoder, SpeakerHypergraphChannel
+from src.topology.topology_3 import (
+    ContextTopologyEncoder,
+    SpeakerHypergraphChannel,
+    TargetTopologyEncoder,
+)
+
+
+def _parse_glan_branches(config):
+    raw = getattr(config, 'glan_branches', 'global,local,struct,final')
+    return [part.strip() for part in str(raw).split(',') if part.strip()]
 
 
 class Attention(nn.Module):
@@ -89,6 +101,7 @@ class SITCL(nn.Module):
         super().__init__()
         self.config = config
         self.use_topology = bool(getattr(config, 'use_topology', 1))
+        self.use_glan_topology = bool(getattr(config, 'use_glan_topology', 0))
         self.use_knowledge_stance_attention = bool(
             getattr(config, 'use_knowledge_stance_attention', 0)
             or getattr(config, 'use_knowledge_gate', 0)
@@ -118,6 +131,21 @@ class SITCL(nn.Module):
             self.topology_encoder = None
             self.topo_norm = None
 
+        if self.use_glan_topology:
+            glan_dropout = float(getattr(config, 'glan_dropout', 0.1))
+            glan_local_window = int(getattr(config, 'topology_local_window', 3))
+            self.glan_encoder = TargetTopologyEncoder(
+                hidden,
+                dropout=glan_dropout,
+                local_window=glan_local_window,
+                branches=_parse_glan_branches(config),
+            )
+            self.glan_norm = nn.LayerNorm(hidden)
+            fusion_dim += hidden
+        else:
+            self.glan_encoder = None
+            self.glan_norm = None
+
         if self.use_knowledge_stance_attention:
             dropout = float(getattr(config, 'knowledge_dropout', 0.1))
             self.stance_knowledge_attn = StanceKnowledgeAttention(hidden, bert_dim=768, dropout=dropout)
@@ -126,6 +154,13 @@ class SITCL(nn.Module):
             self.stance_knowledge_attn = None
 
         self.fc = nn.Linear(fusion_dim, config.num_classes)
+        logging.info(
+            'model_3 init: context=%s glan=%s knowledge=%s (fusion_dim=%d)',
+            self.use_topology,
+            self.use_glan_topology,
+            self.use_knowledge_stance_attention,
+            fusion_dim,
+        )
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -161,6 +196,17 @@ class SITCL(nn.Module):
             return torch.stack([out[st + i, positions[i], :] for i in range(ed - st)])
         return out[st:ed, -2, :]
 
+    def _extract_target_repr(self, out, st, ed, target_idx, dia_id):
+        if target_idx is None:
+            return out[ed - 1, 0, :]
+        last_turn = ed - st - 1
+        span = target_idx[dia_id][last_turn]
+        start, end = int(span[0]), int(span[1])
+        utterance_hidden = out[st + last_turn]
+        if end <= start:
+            return utterance_hidden[start]
+        return utterance_hidden[start:end].mean(dim=0)
+
     def forward(self, **kwargs):
         input_ids = kwargs['input_ids']
         input_masks = kwargs['input_masks']
@@ -169,6 +215,7 @@ class SITCL(nn.Module):
         label = kwargs['label']
         dia_idx = kwargs['dia_idx']
         mask_positions = kwargs.get('mask_positions')
+        target_idx = kwargs.get('target_idx')
         topology_graphs = kwargs.get('topology_graphs')
         knowledge_favor_input_ids = kwargs.get('knowledge_favor_input_ids')
         knowledge_favor_input_masks = kwargs.get('knowledge_favor_input_masks')
@@ -201,9 +248,16 @@ class SITCL(nn.Module):
 
             parts = [self.sem_norm(h_sem)]
 
-            if self.use_topology and topology_graphs is not None:
-                topology_v = self.topology_encoder(v, topology_graphs[dia_id])
+            graph = topology_graphs[dia_id] if topology_graphs is not None else None
+
+            if self.use_topology and self.topology_encoder is not None and graph is not None:
+                topology_v = self.topology_encoder(v, graph)
                 parts.append(self.topo_norm(topology_v[-1]))
+
+            if self.use_glan_topology and self.glan_encoder is not None and graph is not None:
+                target_repr = self._extract_target_repr(out, st, ed, target_idx, dia_id)
+                _, h_glan, _, _ = self.glan_encoder(v, target_repr, graph)
+                parts.append(self.glan_norm(h_glan))
 
             if self.use_knowledge_stance_attention and self.stance_knowledge_attn is not None:
                 if (
