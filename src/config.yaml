@@ -19,7 +19,7 @@ warmup_steps: 0
 
 # topology — context graph + optional GLAN heterograph (speaker hypergraph lives in SSE)
 use_topology: 1
-use_glan_topology: 1
+use_glan_topology: 0
 topology_local_window: 3
 glan_dropout: 0.1
 glan_branches: global,local,struct,final
@@ -62,5 +62,13 @@ target_knowledge_max_chars: 64
 knowledge_stance_only: 0  # load description as neutral side for stance attention
 use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
+
+# v4 — all_label posterior teacher + distilled student (train-only labels)
+use_posterior_knowledge: 1
+posterior_distill_weight: 0.5
+posterior_aux_ce_weight: 0.2
+posterior_dropout: 0.1
+posterior_side_dim: 64
+posterior_temperature: 1.0
 max_seq_length: 256
 max_knowledge_seq_length: 48
