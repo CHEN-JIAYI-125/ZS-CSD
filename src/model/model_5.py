@@ -1,9 +1,5 @@
 """
-v4 — v3 stack + all_label posterior knowledge (train-only teacher, distilled student).
-
-Teacher (train only): history text + gold all_label + final text → importance α_t
-Student (train/infer):  history text + stance prob (no labels) + final text → importance α_s
-Distill KL(α_t || α_s); pool history with α_s and concat to classifier.
+v5 — v4 + implicit latent relation matrix on topology graph, distill, augmented GCN.
 """
 
 import logging
@@ -14,8 +10,9 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 from src.common import map_sequence
-from src.topology.topology_4 import (
+from src.topology.topology_5 import (
     ContextTopologyEncoder,
+    ImplicitTopologyGCN,
     SpeakerHypergraphChannel,
     TargetTopologyEncoder,
 )
@@ -163,9 +160,11 @@ class SITCL(nn.Module):
             or getattr(config, 'use_knowledge_gate', 0)
         )
         self.use_posterior_knowledge = bool(getattr(config, 'use_posterior_knowledge', 1))
+        self.use_implicit_topology = bool(getattr(config, 'use_implicit_topology', 1))
         self.posterior_distill_weight = float(getattr(config, 'posterior_distill_weight', 0.5))
         self.posterior_aux_ce_weight = float(getattr(config, 'posterior_aux_ce_weight', 0.2))
         self.posterior_temperature = float(getattr(config, 'posterior_temperature', 1.0))
+        self.implicit_distill_weight = float(getattr(config, 'implicit_distill_weight', 0.3))
 
         hidden = config.gru_hidden
         num_classes = int(getattr(config, 'num_classes', 3))
@@ -228,15 +227,36 @@ class SITCL(nn.Module):
             self.posterior_branch = None
             self.stance_prior_head = None
 
+        if self.use_implicit_topology:
+            implicit_dropout = float(getattr(config, 'implicit_dropout', 0.2))
+            implicit_side_dim = int(getattr(config, 'implicit_side_dim', 32))
+            implicit_edge_weight = float(getattr(config, 'implicit_edge_weight', 0.5))
+            self.implicit_topology = ImplicitTopologyGCN(
+                hidden,
+                num_classes=num_classes,
+                side_dim=implicit_side_dim,
+                dropout=implicit_dropout,
+                implicit_edge_weight=implicit_edge_weight,
+            )
+            self.implicit_norm = nn.LayerNorm(hidden)
+            fusion_dim += hidden
+            if self.stance_prior_head is None:
+                self.stance_prior_head = nn.Linear(hidden, num_classes)
+        else:
+            self.implicit_topology = None
+            self.implicit_norm = None
+
         self.fc = nn.Linear(fusion_dim, num_classes)
         self.last_posterior_kl = None
+        self.last_implicit_mse = None
 
         logging.info(
-            'model_4 init: context=%s glan=%s knowledge=%s posterior=%s (fusion_dim=%d)',
+            'model_5 init: context=%s glan=%s knowledge=%s posterior=%s implicit=%s (fusion_dim=%d)',
             self.use_topology,
             self.use_glan_topology,
             self.use_knowledge_stance_attention,
             self.use_posterior_knowledge,
+            self.use_implicit_topology,
             fusion_dim,
         )
 
@@ -285,6 +305,12 @@ class SITCL(nn.Module):
             return utterance_hidden[start]
         return utterance_hidden[start:end].mean(dim=0)
 
+    def _all_labels_tensor(self, all_label, dia_id, num_turns, device):
+        labels = all_label[dia_id]
+        if isinstance(labels, torch.Tensor):
+            return labels[:num_turns].to(device=device, dtype=torch.long)
+        return torch.tensor(labels[:num_turns], device=device, dtype=torch.long)
+
     def _history_labels_tensor(self, all_label, dia_id, num_turns, device):
         labels = all_label[dia_id]
         if isinstance(labels, torch.Tensor):
@@ -294,8 +320,32 @@ class SITCL(nn.Module):
         return hist
 
     def _stance_probs_from_text(self, v):
+        if self.stance_prior_head is None:
+            raise RuntimeError('stance_prior_head is required for posterior/implicit paths')
         logits = self.stance_prior_head(v) / max(self.posterior_temperature, 1e-6)
         return F.softmax(logits, dim=-1)
+
+    def _apply_implicit_topology(self, v, graph, all_label, dia_id, parts, implicit_distill_losses):
+        if self.implicit_topology is None:
+            return
+
+        if graph is None or v.size(0) <= 1:
+            parts.append(self.implicit_norm(v[-1]))
+            return
+
+        stance_probs = self._stance_probs_from_text(v)
+        side_student = self.implicit_topology.relation.node_side_from_probs(stance_probs)
+        side_teacher = None
+        if self.training and all_label is not None:
+            turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
+            side_teacher = self.implicit_topology.relation.node_side_from_labels(turn_labels)
+
+        h_implicit, distill_loss, _ = self.implicit_topology(
+            v, graph, side_student, node_side_teacher=side_teacher,
+        )
+        parts.append(self.implicit_norm(h_implicit[-1]))
+        if distill_loss is not None:
+            implicit_distill_losses.append(distill_loss)
 
     def _posterior_importance(self, v, side_features):
         return self.posterior_branch(v, side_features)
@@ -381,6 +431,7 @@ class SITCL(nn.Module):
         stance = []
         distill_losses = []
         aux_losses = []
+        implicit_distill_losses = []
         for dia_id, (st, ed) in enumerate(dia_idx):
             h = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
             o, _ = self.gru(h.unsqueeze(0))
@@ -395,6 +446,11 @@ class SITCL(nn.Module):
             if self.use_topology and self.topology_encoder is not None and graph is not None:
                 topology_v = self.topology_encoder(v, graph)
                 parts.append(self.topo_norm(topology_v[-1]))
+
+            if self.use_implicit_topology:
+                self._apply_implicit_topology(
+                    v, graph, all_label, dia_id, parts, implicit_distill_losses,
+                )
 
             if self.use_glan_topology and self.glan_encoder is not None and graph is not None:
                 target_repr = self._extract_target_repr(out, st, ed, target_idx, dia_id)
@@ -445,5 +501,12 @@ class SITCL(nn.Module):
 
         if aux_losses:
             loss = loss + self.posterior_aux_ce_weight * torch.stack(aux_losses).mean()
+
+        if implicit_distill_losses:
+            mse = torch.stack(implicit_distill_losses).mean()
+            loss = loss + self.implicit_distill_weight * mse
+            self.last_implicit_mse = float(mse.detach().item())
+        else:
+            self.last_implicit_mse = None
 
         return loss, logits, label
