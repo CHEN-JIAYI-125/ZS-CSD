@@ -18,6 +18,7 @@ from src.topology.topology_4 import (
     ContextTopologyEncoder,
     SpeakerHypergraphChannel,
     TargetTopologyEncoder,
+    stance_relation_loss,
 )
 
 
@@ -107,8 +108,8 @@ class StanceKnowledgeAttention(nn.Module):
 class PosteriorImportanceBranch(nn.Module):
     """
     Shared importance scorer over history utterances.
-    Teacher side input: gold label embedding.
-    Student side input: stance probability vector (no labels at inference).
+    Teacher: hist label + final label (all_label posterior).
+    Student: hist stance prob + final stance prob (no labels at inference).
     """
 
     def __init__(self, hidden_dim, num_classes=3, side_dim=64, dropout=0.1):
@@ -116,6 +117,7 @@ class PosteriorImportanceBranch(nn.Module):
         self.num_classes = num_classes
         self.label_embed = nn.Embedding(num_classes, side_dim)
         self.prob_proj = nn.Linear(num_classes, side_dim)
+        self.side_merge = nn.Linear(side_dim * 2, side_dim)
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim * 2 + side_dim, hidden_dim),
             nn.GELU(),
@@ -123,12 +125,17 @@ class PosteriorImportanceBranch(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         self.pool_norm = nn.LayerNorm(hidden_dim)
+        self.readout = nn.Linear(hidden_dim, num_classes)
 
-    def side_from_labels(self, labels):
-        return self.label_embed(labels.long())
+    def side_from_labels(self, hist_labels, final_label):
+        hist = self.label_embed(hist_labels.long())
+        final = self.label_embed(final_label.long()).unsqueeze(0).expand(hist.size(0), -1)
+        return self.side_merge(torch.cat([hist, final], dim=-1))
 
-    def side_from_probs(self, probs):
-        return self.prob_proj(probs)
+    def side_from_probs(self, hist_probs, final_prob):
+        hist = self.prob_proj(hist_probs)
+        final = self.prob_proj(final_prob.unsqueeze(0)).expand(hist.size(0), -1)
+        return self.side_merge(torch.cat([hist, final], dim=-1))
 
     def forward(self, v, side_features):
         """
@@ -163,9 +170,13 @@ class SITCL(nn.Module):
             or getattr(config, 'use_knowledge_gate', 0)
         )
         self.use_posterior_knowledge = bool(getattr(config, 'use_posterior_knowledge', 1))
-        self.posterior_distill_weight = float(getattr(config, 'posterior_distill_weight', 0.5))
-        self.posterior_aux_ce_weight = float(getattr(config, 'posterior_aux_ce_weight', 0.2))
+        self.posterior_fusion_mode = str(getattr(config, 'posterior_fusion_mode', 'loss_only'))
+        self.posterior_distill_weight = float(getattr(config, 'posterior_distill_weight', 0.15))
+        self.posterior_logit_distill_weight = float(getattr(config, 'posterior_logit_distill_weight', 0.3))
+        self.posterior_aux_ce_weight = float(getattr(config, 'posterior_aux_ce_weight', 0.1))
         self.posterior_temperature = float(getattr(config, 'posterior_temperature', 1.0))
+        self.use_stance_relation_loss = bool(getattr(config, 'use_stance_relation_loss', 1))
+        self.stance_relation_weight = float(getattr(config, 'stance_relation_weight', 0.2))
 
         hidden = config.gru_hidden
         num_classes = int(getattr(config, 'num_classes', 3))
@@ -223,7 +234,8 @@ class SITCL(nn.Module):
                 dropout=post_dropout,
             )
             self.stance_prior_head = nn.Linear(hidden, num_classes)
-            fusion_dim += hidden
+            if self.posterior_fusion_mode == 'concat':
+                fusion_dim += hidden
         else:
             self.posterior_branch = None
             self.stance_prior_head = None
@@ -232,11 +244,13 @@ class SITCL(nn.Module):
         self.last_posterior_kl = None
 
         logging.info(
-            'model_4 init: context=%s glan=%s knowledge=%s posterior=%s (fusion_dim=%d)',
+            'model_4 init: context=%s glan=%s knowledge=%s posterior=%s mode=%s relation=%s (fusion_dim=%d)',
             self.use_topology,
             self.use_glan_topology,
             self.use_knowledge_stance_attention,
             self.use_posterior_knowledge,
+            self.posterior_fusion_mode if self.use_posterior_knowledge else 'off',
+            self.use_stance_relation_loss,
             fusion_dim,
         )
 
@@ -285,6 +299,12 @@ class SITCL(nn.Module):
             return utterance_hidden[start]
         return utterance_hidden[start:end].mean(dim=0)
 
+    def _all_labels_tensor(self, all_label, dia_id, num_turns, device):
+        labels = all_label[dia_id]
+        if isinstance(labels, torch.Tensor):
+            return labels[:num_turns].to(device=device, dtype=torch.long)
+        return torch.tensor(labels[:num_turns], device=device, dtype=torch.long)
+
     def _history_labels_tensor(self, all_label, dia_id, num_turns, device):
         labels = all_label[dia_id]
         if isinstance(labels, torch.Tensor):
@@ -300,20 +320,23 @@ class SITCL(nn.Module):
     def _posterior_importance(self, v, side_features):
         return self.posterior_branch(v, side_features)
 
-    def _apply_posterior_knowledge(self, v, all_label, dia_id, parts, distill_losses, aux_losses):
+    def _apply_posterior_knowledge(self, v, all_label, dia_id, parts, distill_losses, aux_losses, logit_distill_losses):
         if self.posterior_branch is None:
             return
 
-        if v.size(0) <= 1:
-            parts.append(self.posterior_branch.pool_norm(v[-1]))
+        num_turns = v.size(0)
+        if num_turns <= 1:
+            if self.posterior_fusion_mode == 'concat':
+                parts.append(self.posterior_branch.pool_norm(v[-1]))
             return
 
-        num_turns = v.size(0)
         hist_len = num_turns - 1
-        stance_probs = self._stance_probs_from_text(v[:hist_len])
-        side_student = self.posterior_branch.side_from_probs(stance_probs)
-        alpha_s, h_pool = self._posterior_importance(v, side_student)
-        parts.append(h_pool)
+        stance_probs = self._stance_probs_from_text(v)
+        final_prob = stance_probs[-1]
+        side_student = self.posterior_branch.side_from_probs(stance_probs[:hist_len], final_prob)
+        alpha_s, h_pool_s = self._posterior_importance(v, side_student)
+        if self.posterior_fusion_mode == 'concat':
+            parts.append(h_pool_s)
 
         if not self.training:
             return
@@ -321,12 +344,14 @@ class SITCL(nn.Module):
         if all_label is None:
             return
 
-        hist_labels = self._history_labels_tensor(all_label, dia_id, num_turns, v.device)
+        turn_labels = self._all_labels_tensor(all_label, dia_id, num_turns, v.device)
+        hist_labels = turn_labels[:hist_len]
         if hist_labels.numel() == 0:
             return
 
-        side_teacher = self.posterior_branch.side_from_labels(hist_labels)
-        alpha_t, _ = self._posterior_importance(v, side_teacher)
+        final_label = turn_labels[-1]
+        side_teacher = self.posterior_branch.side_from_labels(hist_labels, final_label)
+        alpha_t, h_pool_t = self._posterior_importance(v, side_teacher)
         if alpha_t is None or alpha_s is None:
             return
 
@@ -338,6 +363,17 @@ class SITCL(nn.Module):
             )
         )
 
+        if self.posterior_logit_distill_weight > 0:
+            teacher_logits = self.posterior_branch.readout(h_pool_t)
+            student_logits = self.posterior_branch.readout(h_pool_s)
+            logit_distill_losses.append(
+                F.kl_div(
+                    F.log_softmax(student_logits / self.posterior_temperature, dim=-1),
+                    F.softmax(teacher_logits.detach() / self.posterior_temperature, dim=-1),
+                    reduction='batchmean',
+                )
+            )
+
         if self.posterior_aux_ce_weight > 0:
             aux_losses.append(
                 F.cross_entropy(
@@ -345,6 +381,16 @@ class SITCL(nn.Module):
                     hist_labels,
                 )
             )
+
+    def _apply_stance_relation_loss(self, v, all_label, dia_id, relation_losses):
+        if not self.use_stance_relation_loss or not self.training or all_label is None:
+            return
+        turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
+        if turn_labels.numel() < 2:
+            return
+        relation_losses.append(
+            stance_relation_loss(v, turn_labels.tolist(), self.config)
+        )
 
     def forward(self, **kwargs):
         input_ids = kwargs['input_ids']
@@ -381,6 +427,8 @@ class SITCL(nn.Module):
         stance = []
         distill_losses = []
         aux_losses = []
+        logit_distill_losses = []
+        relation_losses = []
         for dia_id, (st, ed) in enumerate(dia_idx):
             h = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
             o, _ = self.gru(h.unsqueeze(0))
@@ -426,8 +474,10 @@ class SITCL(nn.Module):
 
             if self.use_posterior_knowledge:
                 self._apply_posterior_knowledge(
-                    v, all_label, dia_id, parts, distill_losses, aux_losses,
+                    v, all_label, dia_id, parts, distill_losses, aux_losses, logit_distill_losses,
                 )
+
+            self._apply_stance_relation_loss(v, all_label, dia_id, relation_losses)
 
             final_state = self._concat_features(parts)
             stance.append(final_state)
@@ -445,5 +495,11 @@ class SITCL(nn.Module):
 
         if aux_losses:
             loss = loss + self.posterior_aux_ce_weight * torch.stack(aux_losses).mean()
+
+        if logit_distill_losses:
+            loss = loss + self.posterior_logit_distill_weight * torch.stack(logit_distill_losses).mean()
+
+        if relation_losses:
+            loss = loss + self.stance_relation_weight * torch.stack(relation_losses).mean()
 
         return loss, logits, label
