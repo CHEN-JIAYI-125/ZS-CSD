@@ -10,7 +10,7 @@ bert_dir: ./plm/chinese-roberta-wwm-ext/
 # parameter 
 epoch_size: 20
 batchsize: 16
-patience: 3  # v3 best was epoch 8; early stop avoids overfit past ~45.65
+patience: 0  # 0 = run full epoch_size; v3 best was epoch 8
 max_grad_norm: 1.0
 warmup_proportion: 0.1
 gradient_accumulation_steps: 1
@@ -63,17 +63,18 @@ knowledge_stance_only: 0  # load description as neutral side for stance attentio
 use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
 
-# v4 — all_label posterior (train-only): distill representations, infer like v3
+# v4 — all_label posterior (train-only): warmup then distill; infer like v3
 use_posterior_knowledge: 1
-posterior_fusion_mode: loss_only  # concat | loss_only — loss_only keeps v3 fusion_dim at inference
-posterior_distill_weight: 0.15
-posterior_logit_distill_weight: 0.3
-posterior_aux_ce_weight: 0.1
+posterior_fusion_mode: loss_only
+posterior_start_epoch: 8  # epochs 0-7 identical to v3; aux losses from epoch 8
+posterior_distill_weight: 0.1
+posterior_logit_distill_weight: 0.15
+posterior_aux_ce_weight: 0.05
 posterior_dropout: 0.1
 posterior_side_dim: 64
 posterior_temperature: 1.0
 use_stance_relation_loss: 1
-stance_relation_weight: 0.2
+stance_relation_weight: 0.1
 topology_tau: 0.2
 topology_max_pairs: 128
 

@@ -134,6 +134,8 @@ class Main:
 
         for epoch in range(self.config.epoch_size):
             self._apply_training_stage(epoch)
+            if hasattr(self.model, 'set_train_epoch'):
+                self.model.set_train_epoch(epoch)
             train_loss = self.train_iter()
             dev_macro_f1, dev_loss, favor_f1, against_f1, neutral_f1, _, dev_acc = self.evaluate_iter(mode='dev')
 

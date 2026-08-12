@@ -177,6 +177,8 @@ class SITCL(nn.Module):
         self.posterior_temperature = float(getattr(config, 'posterior_temperature', 1.0))
         self.use_stance_relation_loss = bool(getattr(config, 'use_stance_relation_loss', 1))
         self.stance_relation_weight = float(getattr(config, 'stance_relation_weight', 0.2))
+        self.posterior_start_epoch = int(getattr(config, 'posterior_start_epoch', 8))
+        self._train_epoch = 0
 
         hidden = config.gru_hidden
         num_classes = int(getattr(config, 'num_classes', 3))
@@ -254,6 +256,14 @@ class SITCL(nn.Module):
             fusion_dim,
         )
 
+    def set_train_epoch(self, epoch):
+        self._train_epoch = int(epoch)
+
+    def _aux_loss_active(self):
+        if not self.training:
+            return False
+        return self._train_epoch >= self.posterior_start_epoch
+
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
             return None
@@ -324,6 +334,19 @@ class SITCL(nn.Module):
         if self.posterior_branch is None:
             return
 
+        if not self._aux_loss_active():
+            if self.posterior_fusion_mode == 'concat':
+                if v.size(0) <= 1:
+                    parts.append(self.posterior_branch.pool_norm(v[-1]))
+                else:
+                    stance_probs = self._stance_probs_from_text(v)
+                    side_student = self.posterior_branch.side_from_probs(
+                        stance_probs[: v.size(0) - 1], stance_probs[-1],
+                    )
+                    _, h_pool_s = self._posterior_importance(v, side_student)
+                    parts.append(h_pool_s)
+            return
+
         num_turns = v.size(0)
         if num_turns <= 1:
             if self.posterior_fusion_mode == 'concat':
@@ -383,7 +406,7 @@ class SITCL(nn.Module):
             )
 
     def _apply_stance_relation_loss(self, v, all_label, dia_id, relation_losses):
-        if not self.use_stance_relation_loss or not self.training or all_label is None:
+        if not self.use_stance_relation_loss or not self._aux_loss_active() or all_label is None:
             return
         turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
         if turn_labels.numel() < 2:
