@@ -78,11 +78,13 @@ stance_relation_weight: 0.1
 topology_tau: 0.2
 topology_max_pairs: 128
 
-# v5 — implicit latent relation on topology graph (teacher labels → distill → GCN)
-use_implicit_topology: 0
-implicit_distill_weight: 0.3
+# v5 — implicit graph: loss_only distill after warmup; infer same as v3/v4 base
+use_implicit_topology: 1
+implicit_fusion_mode: loss_only
+implicit_distill_weight: 0.08
 implicit_edge_weight: 0.5
 implicit_dropout: 0.2
 implicit_side_dim: 32
+aux_start_epoch: 8
 max_seq_length: 256
 max_knowledge_seq_length: 48

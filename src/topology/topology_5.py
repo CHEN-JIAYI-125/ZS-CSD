@@ -536,6 +536,7 @@ class LatentRelationBranch(nn.Module):
         super().__init__()
         self.label_embed = nn.Embedding(num_classes, side_dim)
         self.prob_proj = nn.Linear(num_classes, side_dim)
+        self.side_merge = nn.Linear(side_dim * 2, side_dim)
         self.pair_scorer = nn.Sequential(
             nn.Linear(hidden_dim * 2 + side_dim * 2, hidden_dim),
             nn.GELU(),
@@ -543,11 +544,19 @@ class LatentRelationBranch(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def node_side_from_labels(self, labels):
-        return self.label_embed(labels.long())
+    def node_side_from_labels(self, labels, final_label=None):
+        side = self.label_embed(labels.long())
+        if final_label is None:
+            return side
+        final = self.label_embed(final_label.long()).unsqueeze(0).expand(side.size(0), -1)
+        return self.side_merge(torch.cat([side, final], dim=-1))
 
-    def node_side_from_probs(self, probs):
-        return self.prob_proj(probs)
+    def node_side_from_probs(self, probs, final_prob=None):
+        side = self.prob_proj(probs)
+        if final_prob is None:
+            return side
+        final = self.prob_proj(final_prob.unsqueeze(0)).expand(side.size(0), -1)
+        return self.side_merge(torch.cat([side, final], dim=-1))
 
     def latent_matrix(self, nodes, node_side):
         num_nodes = nodes.size(0)
