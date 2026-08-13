@@ -77,7 +77,8 @@ class MyDataset(Dataset):
 
 class DataProcessor():
     """
-    v4 dataset loader: v3 fields + all_label for posterior teacher (train-only in model).
+    v4 dataset loader. Target knowledge is read from a local JSON at init time only.
+    Training never performs web search or live knowledge retrieval.
     """
 
     MODEL_KNOWLEDGE_FIELDS = MODEL_KNOWLEDGE_FIELDS

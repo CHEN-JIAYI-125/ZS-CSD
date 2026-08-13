@@ -372,7 +372,7 @@ def build_group_adjacency(graph, num_nodes, group_id, device, dtype):
     if edge_index is None or edge_index.numel() == 0:
         return adj
     if edge_group is None:
-        raise ValueError('topology graph is missing edge_group; rebuild with dataset_v3')
+        raise ValueError('topology graph is missing edge_group; rebuild with dataset_v4')
 
     if edge_index.device != device:
         edge_index = edge_index.to(device)

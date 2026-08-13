@@ -63,31 +63,14 @@ knowledge_stance_only: 0  # load description as neutral side for stance attentio
 use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
 
-# v4 — all_label posterior: teacher uses gold labels; student path at inference
-use_posterior_knowledge: 1
-posterior_fusion_mode: student_path  # concat h_pool + blend history logits; loss_only for ablation
-posterior_logit_blend_weight: 0.25
-posterior_start_epoch: 0  # distill from epoch 1 (0-indexed)
-posterior_distill_weight: 0.1
-posterior_logit_distill_weight: 0.15
-posterior_relation_distill_weight: 0.1
-posterior_pool_distill_weight: 0.05
-posterior_aux_ce_weight: 0.05
-posterior_dropout: 0.1
-posterior_side_dim: 64
-posterior_temperature: 1.0
-use_stance_relation_loss: 1
-stance_relation_weight: 0.1
-topology_tau: 0.2
-topology_max_pairs: 128
+# v4 — reply-relation posterior distill (BERT -> before GRU; test uses student label branch only)
+use_reply_posterior: 1
+reply_posterior_label_dim: 64
+reply_posterior_dropout: 0.1
+reply_posterior_distill_kl_weight: 0.1
+reply_posterior_distill_mse_weight: 0.05
+reply_posterior_teacher_weight: 0.05
+reply_posterior_label_ce_weight: 0.05
 
-# v5 — implicit graph: loss_only distill after warmup; infer same as v3/v4 base
-use_implicit_topology: 1
-implicit_fusion_mode: loss_only
-implicit_distill_weight: 0.08
-implicit_edge_weight: 0.5
-implicit_dropout: 0.2
-implicit_side_dim: 32
-aux_start_epoch: 0
 max_seq_length: 256
 max_knowledge_seq_length: 48
