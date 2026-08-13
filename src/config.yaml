@@ -63,14 +63,12 @@ knowledge_stance_only: 0  # load description as neutral side for stance attentio
 use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
 
-# v4 — reply-relation posterior distill (BERT -> before GRU; test uses student label branch only)
+# v4 — PPED-style all_label posterior (BERT->before GRU); prior path only at inference
 use_reply_posterior: 1
-reply_posterior_label_dim: 64
+reply_posterior_detach: 1
+reply_posterior_tau: 0.2
 reply_posterior_dropout: 0.1
-reply_posterior_distill_kl_weight: 0.1
-reply_posterior_distill_mse_weight: 0.05
-reply_posterior_teacher_weight: 0.05
-reply_posterior_label_ce_weight: 0.05
+reply_posterior_lambda_distill: 0.15
 
 max_seq_length: 256
 max_knowledge_seq_length: 48

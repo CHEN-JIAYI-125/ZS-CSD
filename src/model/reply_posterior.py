@@ -1,122 +1,111 @@
 """
-Reply-relation posterior on raw BERT utterance vectors (768-d), before GRU.
+PPED-style all_label posterior distillation (adapted for v4 pre-GRU placement).
 
-Placement:  BERT -> ReplyPosteriorDistiller (train aux loss) -> GRU -> SSE -> topology
-Not parallel to GRU: distillation reads h_bert once, then the same h_bert enters GRU.
-
-Teacher/student are two parallel heads on h_bert (teacher uses h+gold label; student label-only).
+Prior selector (inference): text-only query + history -> importance over history.
+Posterior selector (train teacher): label-augmented query/history -> same-shaped distribution.
+Loss: KL(posterior.detach() || prior) on detached BERT vectors so main v3 path is preserved.
+Reference: model_pped_final — SpeakerAwareEvidenceEstimator + posterior_query_proj + label_emb.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-def lower_triangular_mask(num_turns, device):
-    return torch.tril(torch.ones(num_turns, num_turns, device=device, dtype=torch.bool))
+from src.common import map_sequence
 
 
-def masked_row_targets(reply_parents, num_turns, device):
-    """Gold reply parent index for each row (self if no valid parent)."""
-    targets = []
-    for i in range(num_turns):
-        parent = int(reply_parents[i]) if i < len(reply_parents) else i
-        if parent < 0 or parent > i:
-            parent = i
-        targets.append(parent)
-    return torch.tensor(targets, device=device, dtype=torch.long)
+class SpeakerAwareHistorySelector(nn.Module):
+    """Score historical utterances for the final query (PPED SpeakerAwareEvidenceEstimator)."""
+
+    def __init__(self, hidden_dim: int, dropout: float = 0.1, tau: float = 0.2):
+        super().__init__()
+        self.tau = tau
+        self.speaker_emb = nn.Embedding(2, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, query_repr, history_repr, query_speaker, hist_speakers, target_repr):
+        length = history_repr.size(0)
+        if length == 0:
+            return torch.empty(0, device=query_repr.device)
+
+        if not torch.is_tensor(hist_speakers):
+            hist_speakers = torch.as_tensor(hist_speakers, device=query_repr.device)
+        hist_speakers = hist_speakers.reshape(-1)
+
+        speaker_type = (hist_speakers != query_speaker).long()
+        speaker_feat = self.speaker_emb(speaker_type)
+
+        query_exp = query_repr.unsqueeze(0).expand(length, -1)
+        target_exp = target_repr.unsqueeze(0).expand(length, -1)
+        query_cond = query_exp + target_exp
+        history_cond = history_repr + speaker_feat
+        features = torch.cat([query_cond, history_cond], dim=-1)
+        logits = self.scorer(self.dropout(features)).squeeze(-1)
+        return F.softmax(logits / max(self.tau, 1e-4), dim=-1)
 
 
-class ReplyPosteriorDistiller(nn.Module):
+class PosteriorHistoryDistiller(nn.Module):
     """
-    Row i predicts a distribution over columns j<=i (reply-to history including self).
-    Both branches emit the same [n, n] lower-triangular stochastic matrix.
+    Train-only teacher/student over dialog history before GRU.
+    Student = prior selector (text); teacher = posterior selector (h + all_label).
     """
 
-    def __init__(self, hidden_dim=768, num_classes=3, label_dim=64, dropout=0.1):
+    def __init__(self, hidden_dim=768, num_classes=3, dropout=0.1, tau=0.2):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.num_classes = num_classes
-
-        self.teacher_label_embed = nn.Embedding(num_classes, label_dim)
-        self.posterior_fuse = nn.Sequential(
-            nn.Linear(hidden_dim + label_dim, hidden_dim),
-            nn.GELU(),
+        self.label_emb = nn.Embedding(num_classes, hidden_dim)
+        self.posterior_query_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.Dropout(dropout),
-            nn.LayerNorm(hidden_dim),
-        )
-
-        self.student_label_embed = nn.Embedding(num_classes, label_dim)
-        self.label_head = nn.Linear(hidden_dim, num_classes)
-        self.student_fuse = nn.Sequential(
-            nn.Linear(label_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.LayerNorm(hidden_dim),
         )
-
-        self.scale = hidden_dim ** -0.5
-
-    def _reply_logits(self, node_repr):
-        logits = torch.matmul(node_repr, node_repr.transpose(0, 1)) * self.scale
-        mask = lower_triangular_mask(node_repr.size(0), node_repr.device)
-        logits = logits.masked_fill(~mask, -1e4)
-        return logits, mask
-
-    def _reply_probs(self, logits):
-        return F.softmax(logits, dim=-1)
-
-    def teacher_forward(self, hidden, gold_labels):
-        label_vec = self.teacher_label_embed(gold_labels.long())
-        posterior_repr = self.posterior_fuse(torch.cat([hidden, label_vec], dim=-1))
-        logits, mask = self._reply_logits(posterior_repr)
-        return self._reply_probs(logits), logits, mask
-
-    def student_forward(self, hidden):
-        label_logits = self.label_head(hidden)
-        label_probs = F.softmax(label_logits, dim=-1)
-        label_vec = torch.matmul(label_probs, self.student_label_embed.weight)
-        student_repr = self.student_fuse(label_vec)
-        logits, mask = self._reply_logits(student_repr)
-        probs = self._reply_probs(logits)
-        return probs, logits, mask, label_logits
+        self.prior_selector = SpeakerAwareHistorySelector(hidden_dim, dropout=dropout, tau=tau)
+        self.posterior_selector = SpeakerAwareHistorySelector(hidden_dim, dropout=dropout, tau=tau)
 
     @staticmethod
-    def _row_distill_loss(probs_student, probs_teacher):
-        """KL + MSE on each lower-triangular row only (avoid 0*log(0) on masked cells)."""
-        num_turns = probs_student.size(0)
-        kl_rows = []
-        mse_rows = []
-        for i in range(num_turns):
-            end = i + 1
-            p_s = probs_student[i, :end].clamp_min(1e-8)
-            p_t = probs_teacher[i, :end].detach().clamp_min(1e-8)
-            kl_rows.append(F.kl_div(p_s.log(), p_t, reduction='sum'))
-            mse_rows.append(F.mse_loss(p_s, p_t, reduction='sum'))
-        return torch.stack(kl_rows).mean(), torch.stack(mse_rows).mean()
+    def _posterior_kl(prior_prob, posterior_prob):
+        teacher = posterior_prob.detach().clamp_min(1e-12)
+        student = prior_prob.clamp_min(1e-12)
+        return torch.sum(teacher * (teacher.log() - student.log()))
 
-    def training_losses(self, hidden, gold_labels, reply_parents):
-        probs_teacher, logits_teacher, _ = self.teacher_forward(hidden, gold_labels)
-        probs_student, _, _, label_logits = self.student_forward(hidden)
+    def training_losses(self, hidden, speakers, gold_labels, target_repr, detach_hidden=True):
+        if hidden.size(0) <= 1:
+            return None
 
-        distill_kl, distill_mse = self._row_distill_loss(probs_student, probs_teacher)
+        if detach_hidden:
+            hidden = hidden.detach()
+            target_repr = target_repr.detach()
 
-        row_targets = masked_row_targets(reply_parents, hidden.size(0), hidden.device)
-        teacher_rows = []
-        for i in range(hidden.size(0)):
-            teacher_rows.append(logits_teacher[i, : i + 1])
-        teacher_ce = torch.stack([
-            F.cross_entropy(teacher_rows[i].unsqueeze(0), row_targets[i].unsqueeze(0))
-            for i in range(hidden.size(0))
-        ]).mean()
+        final_utt = hidden[-1]
+        history = hidden[:-1]
+        hist_labels = gold_labels[:-1]
 
-        label_ce = F.cross_entropy(label_logits, gold_labels.long())
+        speakers_mapped = map_sequence(speakers)
+        speaker_ids = torch.tensor(speakers_mapped, device=hidden.device, dtype=torch.long)
+        query_speaker = speaker_ids[-1]
+        hist_speakers = speaker_ids[:-1]
+
+        prior_prob = self.prior_selector(
+            final_utt, history, query_speaker, hist_speakers, target_repr,
+        )
+        if prior_prob.numel() == 0:
+            return None
+
+        query_label = self.label_emb(gold_labels[-1].long())
+        posterior_query = self.posterior_query_proj(torch.cat([final_utt, query_label], dim=-1))
+        history_post = history + self.label_emb(hist_labels.long())
+        posterior_prob = self.posterior_selector(
+            posterior_query, history_post, query_speaker, hist_speakers, target_repr,
+        )
+        if posterior_prob.numel() == 0:
+            return None
 
         return {
-            'distill_kl': distill_kl,
-            'distill_mse': distill_mse,
-            'teacher_ce': teacher_ce,
-            'label_ce': label_ce,
-            'probs_teacher': probs_teacher,
-            'probs_student': probs_student,
+            'distill_kl': self._posterior_kl(prior_prob, posterior_prob),
         }
