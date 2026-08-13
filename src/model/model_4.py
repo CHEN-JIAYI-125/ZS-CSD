@@ -335,9 +335,13 @@ class SITCL(nn.Module):
             distill_mse = torch.stack([item['distill_mse'] for item in reply_losses]).mean()
             teacher_ce = torch.stack([item['teacher_ce'] for item in reply_losses]).mean()
             label_ce = torch.stack([item['label_ce'] for item in reply_losses]).mean()
-            loss = loss + self.reply_posterior_distill_kl_weight * distill_kl
-            loss = loss + self.reply_posterior_distill_mse_weight * distill_mse
-            loss = loss + self.reply_posterior_teacher_weight * teacher_ce
-            loss = loss + self.reply_posterior_label_ce_weight * label_ce
+            if torch.isfinite(distill_kl):
+                loss = loss + self.reply_posterior_distill_kl_weight * distill_kl
+            if torch.isfinite(distill_mse):
+                loss = loss + self.reply_posterior_distill_mse_weight * distill_mse
+            if torch.isfinite(teacher_ce):
+                loss = loss + self.reply_posterior_teacher_weight * teacher_ce
+            if torch.isfinite(label_ce):
+                loss = loss + self.reply_posterior_label_ce_weight * label_ce
 
         return loss, logits, label

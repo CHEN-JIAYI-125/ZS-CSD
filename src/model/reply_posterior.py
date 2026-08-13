@@ -57,45 +57,59 @@ class ReplyPosteriorDistiller(nn.Module):
 
         self.scale = hidden_dim ** -0.5
 
-    def _reply_matrix(self, node_repr):
+    def _reply_logits(self, node_repr):
         logits = torch.matmul(node_repr, node_repr.transpose(0, 1)) * self.scale
         mask = lower_triangular_mask(node_repr.size(0), node_repr.device)
-        logits = logits.masked_fill(~mask, float('-inf'))
-        probs = F.softmax(logits, dim=-1)
-        return probs, mask
+        logits = logits.masked_fill(~mask, -1e4)
+        return logits, mask
+
+    def _reply_probs(self, logits):
+        return F.softmax(logits, dim=-1)
 
     def teacher_forward(self, hidden, gold_labels):
         label_vec = self.teacher_label_embed(gold_labels.long())
         posterior_repr = self.posterior_fuse(torch.cat([hidden, label_vec], dim=-1))
-        return self._reply_matrix(posterior_repr)
+        logits, mask = self._reply_logits(posterior_repr)
+        return self._reply_probs(logits), logits, mask
 
     def student_forward(self, hidden):
         label_logits = self.label_head(hidden)
         label_probs = F.softmax(label_logits, dim=-1)
         label_vec = torch.matmul(label_probs, self.student_label_embed.weight)
         student_repr = self.student_fuse(label_vec)
-        matrix, mask = self._reply_matrix(student_repr)
-        return matrix, mask, label_logits
+        logits, mask = self._reply_logits(student_repr)
+        probs = self._reply_probs(logits)
+        return probs, logits, mask, label_logits
+
+    @staticmethod
+    def _row_distill_loss(probs_student, probs_teacher):
+        """KL + MSE on each lower-triangular row only (avoid 0*log(0) on masked cells)."""
+        num_turns = probs_student.size(0)
+        kl_rows = []
+        mse_rows = []
+        for i in range(num_turns):
+            end = i + 1
+            p_s = probs_student[i, :end].clamp_min(1e-8)
+            p_t = probs_teacher[i, :end].detach().clamp_min(1e-8)
+            kl_rows.append(F.kl_div(p_s.log(), p_t, reduction='sum'))
+            mse_rows.append(F.mse_loss(p_s, p_t, reduction='sum'))
+        return torch.stack(kl_rows).mean(), torch.stack(mse_rows).mean()
 
     def training_losses(self, hidden, gold_labels, reply_parents):
-        probs_teacher, mask = self.teacher_forward(hidden, gold_labels)
-        probs_student, _, label_logits = self.student_forward(hidden)
+        probs_teacher, logits_teacher, _ = self.teacher_forward(hidden, gold_labels)
+        probs_student, _, _, label_logits = self.student_forward(hidden)
 
-        valid = mask.float()
-        denom = valid.sum().clamp_min(1.0)
-
-        distill_kl = F.kl_div(
-            probs_student.log().clamp_min(-20.0),
-            probs_teacher.detach(),
-            reduction='none',
-        )
-        distill_kl = (distill_kl * valid).sum() / denom
-
-        distill_mse = F.mse_loss(probs_student, probs_teacher.detach(), reduction='none')
-        distill_mse = (distill_mse * valid).sum() / denom
+        distill_kl, distill_mse = self._row_distill_loss(probs_student, probs_teacher)
 
         row_targets = masked_row_targets(reply_parents, hidden.size(0), hidden.device)
-        teacher_ce = F.nll_loss(probs_teacher.log().clamp_min(-20.0), row_targets)
+        teacher_rows = []
+        for i in range(hidden.size(0)):
+            teacher_rows.append(logits_teacher[i, : i + 1])
+        teacher_ce = torch.stack([
+            F.cross_entropy(teacher_rows[i].unsqueeze(0), row_targets[i].unsqueeze(0))
+            for i in range(hidden.size(0))
+        ]).mean()
+
         label_ce = F.cross_entropy(label_logits, gold_labels.long())
 
         return {
