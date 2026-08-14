@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 from src.common import map_sequence
-from src.model.reply_posterior import PosteriorHistoryDistiller
+from src.model.reply_posterior import PosteriorEvidenceModule
 from src.topology.topology_4 import (
     ContextTopologyEncoder,
     SpeakerHypergraphChannel,
@@ -108,10 +108,12 @@ class SITCL(nn.Module):
             or getattr(config, 'use_knowledge_gate', 0)
         )
         self.use_reply_posterior = bool(getattr(config, 'use_reply_posterior', 1))
-        self.reply_posterior_detach = bool(getattr(config, 'reply_posterior_detach', 1))
+        self.reply_posterior_fusion = str(
+            getattr(config, 'reply_posterior_fusion', 'loss_only')
+        ).strip().lower()
         self.reply_posterior_lambda_distill = float(
             getattr(config, 'reply_posterior_lambda_distill',
-                    getattr(config, 'reply_posterior_distill_kl_weight', 0.15))
+                    getattr(config, 'reply_posterior_distill_kl_weight', 0.5))
         )
         hidden = config.gru_hidden
         self.bert = AutoModel.from_pretrained(config.bert_dir)
@@ -164,22 +166,25 @@ class SITCL(nn.Module):
             reply_dropout = float(getattr(config, 'reply_posterior_dropout', 0.1))
             reply_tau = float(getattr(config, 'reply_posterior_tau', 0.2))
             num_classes = int(getattr(config, 'num_classes', 3))
-            self.reply_posterior = PosteriorHistoryDistiller(
-                hidden_dim=768,
+            self.reply_posterior = PosteriorEvidenceModule(
+                hidden_dim=hidden,
                 num_classes=num_classes,
                 dropout=reply_dropout,
                 tau=reply_tau,
             )
+            if self.reply_posterior_fusion == 'pool':
+                fusion_dim += hidden
         else:
             self.reply_posterior = None
 
         self.fc = nn.Linear(fusion_dim, config.num_classes)
         logging.info(
-            'model_4 init: context=%s glan=%s knowledge=%s reply_posterior=%s (fusion_dim=%d)',
+            'model_4 init: context=%s glan=%s knowledge=%s reply_posterior=%s fusion=%s (fusion_dim=%d)',
             self.use_topology,
             self.use_glan_topology,
             self.use_knowledge_stance_attention,
             self.use_reply_posterior,
+            self.reply_posterior_fusion if self.use_reply_posterior else 'off',
             fusion_dim,
         )
 
@@ -234,22 +239,29 @@ class SITCL(nn.Module):
             return labels[:num_turns].to(device=device, dtype=torch.long)
         return torch.tensor(labels[:num_turns], device=device, dtype=torch.long)
 
-    def _pre_gru_reply_distill(self, h_bert, all_label, speakers, target_repr, dia_id, reply_losses):
-        """PPED-style prior<-posterior KL on BERT vectors; main GRU path unchanged."""
-        if self.reply_posterior is None or not self.training or all_label is None:
+    def _apply_posterior_evidence(self, v, all_label, speakers, dia_id, parts, reply_losses):
+        """all_label posterior KL (train); optional prior pool concat when fusion=pool."""
+        if self.reply_posterior is None:
             return
-        if h_bert.size(0) <= 1:
-            return
-        turn_labels = self._all_labels_tensor(all_label, dia_id, h_bert.size(0), h_bert.device)
-        losses = self.reply_posterior.training_losses(
-            h_bert,
-            speakers[dia_id],
-            turn_labels,
-            target_repr,
-            detach_hidden=self.reply_posterior_detach,
-        )
-        if losses is not None:
-            reply_losses.append(losses)
+
+        use_pool = self.reply_posterior_fusion == 'pool'
+        if self.training and all_label is not None:
+            turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
+            out = self.reply_posterior.training_losses(
+                v, speakers[dia_id], turn_labels, return_pool=use_pool,
+            )
+            if out is None:
+                return
+            if use_pool:
+                losses, v_pool = out
+                parts.append(v_pool)
+            else:
+                losses = out
+            if losses is not None:
+                reply_losses.append(losses)
+        elif use_pool:
+            _, v_pool = self.reply_posterior.forward_prior(v, speakers[dia_id])
+            parts.append(v_pool)
 
     def forward(self, **kwargs):
         input_ids = kwargs['input_ids']
@@ -287,14 +299,18 @@ class SITCL(nn.Module):
         reply_losses = []
         for dia_id, (st, ed) in enumerate(dia_idx):
             h_bert = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
-            target_repr = self._extract_target_repr(out, st, ed, target_idx, dia_id)
-            self._pre_gru_reply_distill(h_bert, all_label, speakers, target_repr, dia_id, reply_losses)
+            target_repr_bert = self._extract_target_repr(out, st, ed, target_idx, dia_id)
             o, _ = self.gru(h_bert.unsqueeze(0))
             o = o.squeeze(0)
             v = self.SSE(o, speakers[dia_id])
             h_sem = v[-1]
 
             parts = [self.sem_norm(h_sem)]
+
+            if self.use_reply_posterior:
+                self._apply_posterior_evidence(
+                    v, all_label, speakers, dia_id, parts, reply_losses,
+                )
 
             graph = topology_graphs[dia_id] if topology_graphs is not None else None
 
@@ -303,8 +319,7 @@ class SITCL(nn.Module):
                 parts.append(self.topo_norm(topology_v[-1]))
 
             if self.use_glan_topology and self.glan_encoder is not None and graph is not None:
-                target_repr = self._extract_target_repr(out, st, ed, target_idx, dia_id)
-                _, h_glan, _, _ = self.glan_encoder(v, target_repr, graph)
+                _, h_glan, _, _ = self.glan_encoder(v, target_repr_bert, graph)
                 parts.append(self.glan_norm(h_glan))
 
             if self.use_knowledge_stance_attention and self.stance_knowledge_attn is not None:
