@@ -64,7 +64,7 @@ use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, conc
 knowledge_dropout: 0.1
 
 # v4 — all_label reply-relation posterior (BERT->GRU aux); 0 = identical to v3
-use_reply_posterior: 1
+use_reply_posterior: 0
 reply_posterior_tau: 0.2
 reply_posterior_dropout: 0.1
 reply_posterior_lambda_distill: 0.5
