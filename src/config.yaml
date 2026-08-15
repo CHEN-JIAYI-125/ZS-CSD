@@ -63,13 +63,15 @@ knowledge_stance_only: 0  # load description as neutral side for stance attentio
 use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
 
-# v4 — all_label reply-relation posterior (BERT->GRU aux); 0 = identical to v3
+# v4 — all_label reply posterior: student pool @ inference + KL (posterior teacher)
 use_reply_posterior: 1
 reply_posterior_tau: 0.2
 reply_posterior_dropout: 0.1
-reply_posterior_lambda_distill: 0.5
-reply_posterior_label_ce_weight: 0.5
-reply_posterior_teacher_ce_weight: 0.5
+reply_posterior_lambda_distill: 0.2
+reply_posterior_label_ce_weight: 0.1
+reply_posterior_warmup_epochs: 8
+reply_posterior_gate_init: -4.0
+reply_posterior_gate_max: 0.12
 
 max_seq_length: 256
 max_knowledge_seq_length: 48

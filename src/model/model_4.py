@@ -109,14 +109,21 @@ class SITCL(nn.Module):
         )
         self.use_reply_posterior = bool(getattr(config, 'use_reply_posterior', 0))
         self.reply_posterior_lambda_distill = float(
-            getattr(config, 'reply_posterior_lambda_distill', 0.5)
+            getattr(config, 'reply_posterior_lambda_distill', 0.1)
         )
         self.reply_posterior_label_ce_weight = float(
-            getattr(config, 'reply_posterior_label_ce_weight', 0.5)
+            getattr(config, 'reply_posterior_label_ce_weight', 0.1)
         )
         self.reply_posterior_teacher_ce_weight = float(
-            getattr(config, 'reply_posterior_teacher_ce_weight', 0.5)
+            getattr(config, 'reply_posterior_teacher_ce_weight', 0.0)
         )
+        self.reply_posterior_warmup_epochs = int(
+            getattr(config, 'reply_posterior_warmup_epochs', 8)
+        )
+        self.reply_posterior_gate_max = float(
+            getattr(config, 'reply_posterior_gate_max', 0.12)
+        )
+        self.train_epoch = 0
         hidden = config.gru_hidden
         self.bert = AutoModel.from_pretrained(config.bert_dir)
         self.gru = nn.GRU(input_size=768, hidden_size=hidden, num_layers=config.gru_layer, batch_first=True)
@@ -174,8 +181,11 @@ class SITCL(nn.Module):
                 dropout=reply_dropout,
                 tau=reply_tau,
             )
+            gate_init = float(getattr(config, 'reply_posterior_gate_init', -4.0))
+            self.reply_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float))
         else:
             self.reply_posterior = None
+            self.reply_gate = None
 
         self.fc = nn.Linear(fusion_dim, config.num_classes)
         logging.info(
@@ -185,6 +195,16 @@ class SITCL(nn.Module):
             self.use_knowledge_stance_attention,
             self.use_reply_posterior,
             fusion_dim,
+        )
+
+    def set_train_epoch(self, epoch):
+        self.train_epoch = int(epoch)
+
+    def _posterior_active(self):
+        return (
+            self.use_reply_posterior
+            and self.training
+            and self.train_epoch >= self.reply_posterior_warmup_epochs
         )
 
     def _build_class_weights(self, config):
@@ -238,16 +258,21 @@ class SITCL(nn.Module):
             return labels[:num_turns].to(device=device, dtype=torch.long)
         return torch.tensor(labels[:num_turns], device=device, dtype=torch.long)
 
-    def _pre_gru_reply_distill(self, h_bert, all_label, reply_parents, dia_id, reply_losses):
-        """BERT -> reply posterior (train aux) -> same h_bert -> GRU."""
-        if self.reply_posterior is None or not self.training:
+    def _reply_gate_value(self):
+        if not self.use_reply_posterior or self.reply_gate is None:
+            return 0.0
+        if self.training and self.train_epoch < self.reply_posterior_warmup_epochs:
+            return 0.0
+        return (torch.sigmoid(self.reply_gate) * self.reply_posterior_gate_max).item()
+
+    def _collect_reply_distill(self, h_bert, all_label, reply_parents, dia_id, reply_losses):
+        if not self._posterior_active() or self.reply_posterior is None:
             return
         if all_label is None or reply_parents is None:
             return
 
         turn_labels = self._all_labels_tensor(all_label, dia_id, h_bert.size(0), h_bert.device)
-        parents = reply_parents[dia_id]
-        losses = self.reply_posterior(h_bert.detach(), turn_labels, parents)
+        losses = self.reply_posterior.distillation_losses(h_bert, turn_labels)
         if losses is not None:
             reply_losses.append(losses)
 
@@ -286,11 +311,14 @@ class SITCL(nn.Module):
 
         stance = []
         reply_losses = []
+        reply_h_cache = []
+        reply_gate = self._reply_gate_value()
         for dia_id, (st, ed) in enumerate(dia_idx):
             h = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
-
-            if self.use_reply_posterior:
-                self._pre_gru_reply_distill(h, all_label, reply_parents, dia_id, reply_losses)
+            if self.use_reply_posterior and self.reply_posterior is not None and reply_gate > 0:
+                h = self.reply_posterior.enrich_gru_input(h, reply_gate)
+            if self._posterior_active():
+                reply_h_cache.append((h.detach(), dia_id))
 
             o, _ = self.gru(h.unsqueeze(0))
             o = o.squeeze(0)
@@ -339,15 +367,15 @@ class SITCL(nn.Module):
         logits = self.fc(stance)
         loss = self.criterion(logits, label)
 
+        for h_det, dia_id in reply_h_cache:
+            self._collect_reply_distill(h_det, all_label, reply_parents, dia_id, reply_losses)
+
         if reply_losses:
             distill_kl = torch.stack([item['distill_kl'] for item in reply_losses]).mean()
             label_ce = torch.stack([item['label_ce'] for item in reply_losses]).mean()
-            teacher_ce = torch.stack([item['teacher_reply_ce'] for item in reply_losses]).mean()
             if torch.isfinite(distill_kl) and self.reply_posterior_lambda_distill > 0:
                 loss = loss + self.reply_posterior_lambda_distill * distill_kl
             if torch.isfinite(label_ce) and self.reply_posterior_label_ce_weight > 0:
                 loss = loss + self.reply_posterior_label_ce_weight * label_ce
-            if torch.isfinite(teacher_ce) and self.reply_posterior_teacher_ce_weight > 0:
-                loss = loss + self.reply_posterior_teacher_ce_weight * teacher_ce
 
         return loss, logits, label
