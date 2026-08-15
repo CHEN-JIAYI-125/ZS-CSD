@@ -63,12 +63,13 @@ knowledge_stance_only: 0  # load description as neutral side for stance attentio
 use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
 
-# v4 — all_label posterior->prior KL (after SSE); loss_only keeps v3 fusion_dim
+# v4 — all_label reply-relation posterior (BERT->GRU aux); 0 = identical to v3
 use_reply_posterior: 1
-reply_posterior_fusion: loss_only  # loss_only | pool (+768 to classifier)
 reply_posterior_tau: 0.2
 reply_posterior_dropout: 0.1
 reply_posterior_lambda_distill: 0.5
+reply_posterior_label_ce_weight: 0.5
+reply_posterior_teacher_ce_weight: 0.5
 
 max_seq_length: 256
 max_knowledge_seq_length: 48
