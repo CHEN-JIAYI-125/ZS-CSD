@@ -10,7 +10,7 @@ bert_dir: ./plm/chinese-roberta-wwm-ext/
 # parameter 
 epoch_size: 20
 batchsize: 16
-patience: 3  # v3 best ~epoch 8; stop if dev F1 drops after early peak
+patience: 0  # train full epoch_size (20)
 max_grad_norm: 1.0
 warmup_proportion: 0.1
 gradient_accumulation_steps: 1
@@ -63,17 +63,20 @@ knowledge_stance_only: 0  # load description as neutral side for stance attentio
 use_knowledge_stance_attention: 1  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
 
-# v4 — reply posterior: KL from ep1; student evidence gate ramps ep8-12
-use_reply_posterior: 1
+# v5 — PPED-aligned latent reply graph (posterior=all_label, prior=sentence-only)
+use_latent_reply: 1
+use_reply_posterior: 0  # legacy v4 gate; keep 0 when using model_5
 reply_posterior_tau: 0.2
 reply_posterior_dropout: 0.1
-reply_posterior_lambda_distill: 0.2
-reply_posterior_label_ce_weight: 0.05
-reply_posterior_kl_warmup_epochs: 1
-reply_posterior_gate_warmup_epochs: 8
-reply_posterior_gate_ramp_epochs: 4
-reply_posterior_gate_init: -4.0
-reply_posterior_gate_max: 0.1
+reply_kl_lambda: 0.05
+reply_pseudo_lambda: 0.02
+reply_conf_threshold: 0.7
+reply_kl_final_row_weight: 1.0
+reply_kl_full_weight: 0.5
+reply_beta_zero_epochs: 2   # ep1-2: beta=0 (match v3); ep3-5: 0.05; ep6+: 0.10
+reply_beta_mid_epochs: 5
+reply_beta_mid: 0.05
+reply_beta_max: 0.10
 
 max_seq_length: 256
 max_knowledge_seq_length: 48

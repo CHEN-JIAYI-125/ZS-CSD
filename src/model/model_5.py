@@ -2,11 +2,9 @@ import logging
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoModel
 
-from src.common import map_sequence
-from src.model.reply_posterior import ReplyPosteriorDistiller
+from src.model.latent_reply_graph import LatentReplyGraph
 from src.topology.topology_4 import (
     ContextTopologyEncoder,
     SpeakerHypergraphChannel,
@@ -17,6 +15,16 @@ from src.topology.topology_4 import (
 def _parse_glan_branches(config):
     raw = getattr(config, 'glan_branches', 'global,local,struct,final')
     return [part.strip() for part in str(raw).split(',') if part.strip()]
+
+
+def _graph_field(graph, name):
+    if graph is None:
+        return None
+    if hasattr(graph, name):
+        return getattr(graph, name)
+    if isinstance(graph, dict) and name in graph:
+        return graph[name]
+    return None
 
 
 class Attention(nn.Module):
@@ -40,8 +48,6 @@ class Attention(nn.Module):
 
 
 class SSE(nn.Module):
-    """Speaker-aware encoding: intra dialogue attention + speaker hypergraph inter."""
-
     def __init__(self, hidden_dim=768, dropout=0.2):
         super().__init__()
         self.linear_intra = nn.Linear(hidden_dim * 2, hidden_dim)
@@ -49,6 +55,8 @@ class SSE(nn.Module):
         self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
 
     def forward(self, utterances, speakers):
+        from src.common import map_sequence
+
         device = utterances.device
         speakers_mapped = map_sequence(speakers)
         speaker_ids = torch.tensor(speakers_mapped, device=device)
@@ -72,8 +80,6 @@ class SSE(nn.Module):
 
 
 class StanceKnowledgeAttention(nn.Module):
-    """Attend from current utterance to favor / against / neutral knowledge sides."""
-
     def __init__(self, hidden_dim, bert_dim=768, dropout=0.1):
         super().__init__()
         self.know_norm = nn.LayerNorm(bert_dim)
@@ -98,6 +104,8 @@ class StanceKnowledgeAttention(nn.Module):
 
 
 class SITCL(nn.Module):
+    """v3 backbone + PPED-aligned latent reply graph (posterior labels, prior sentences only)."""
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -107,26 +115,20 @@ class SITCL(nn.Module):
             getattr(config, 'use_knowledge_stance_attention', 0)
             or getattr(config, 'use_knowledge_gate', 0)
         )
-        self.use_reply_posterior = bool(getattr(config, 'use_reply_posterior', 0))
-        self.reply_posterior_lambda_distill = float(
-            getattr(config, 'reply_posterior_lambda_distill', 0.2)
+        self.use_latent_reply = bool(
+            getattr(config, 'use_latent_reply', getattr(config, 'use_reply_posterior', 0))
         )
-        self.reply_posterior_label_ce_weight = float(
-            getattr(config, 'reply_posterior_label_ce_weight', 0.05)
-        )
-        self.reply_posterior_kl_warmup_epochs = int(
-            getattr(config, 'reply_posterior_kl_warmup_epochs', 1)
-        )
-        self.reply_posterior_gate_warmup_epochs = int(
-            getattr(config, 'reply_posterior_gate_warmup_epochs', 8)
-        )
-        self.reply_posterior_gate_ramp_epochs = int(
-            getattr(config, 'reply_posterior_gate_ramp_epochs', 4)
-        )
-        self.reply_posterior_gate_max = float(
-            getattr(config, 'reply_posterior_gate_max', 0.1)
-        )
+        self.reply_kl_lambda = float(getattr(config, 'reply_kl_lambda', 0.05))
+        self.reply_pseudo_lambda = float(getattr(config, 'reply_pseudo_lambda', 0.02))
+        self.reply_conf_threshold = float(getattr(config, 'reply_conf_threshold', 0.7))
+        self.reply_kl_final_row_weight = float(getattr(config, 'reply_kl_final_row_weight', 1.0))
+        self.reply_kl_full_weight = float(getattr(config, 'reply_kl_full_weight', 0.5))
+        self.reply_beta_zero_epochs = int(getattr(config, 'reply_beta_zero_epochs', 2))
+        self.reply_beta_mid_epochs = int(getattr(config, 'reply_beta_mid_epochs', 5))
+        self.reply_beta_mid = float(getattr(config, 'reply_beta_mid', 0.05))
+        self.reply_beta_max = float(getattr(config, 'reply_beta_max', 0.10))
         self.train_epoch = 0
+
         hidden = config.gru_hidden
         self.bert = AutoModel.from_pretrained(config.bert_dir)
         self.gru = nn.GRU(input_size=768, hidden_size=hidden, num_layers=config.gru_layer, batch_first=True)
@@ -138,13 +140,12 @@ class SITCL(nn.Module):
         dropout = float(getattr(config, 'sse_dropout', 0.2))
         self.SSE = SSE(hidden_dim=hidden, dropout=dropout)
         self.sem_norm = nn.LayerNorm(hidden)
+        self.reply_fuse_norm = nn.LayerNorm(hidden)
 
         fusion_dim = hidden
         if self.use_topology:
-            dropout = float(getattr(config, 'topology_dropout', 0.2))
             self.topology_encoder = ContextTopologyEncoder(
-                hidden,
-                dropout=dropout,
+                hidden, dropout=float(getattr(config, 'topology_dropout', 0.2)),
             )
             self.topo_norm = nn.LayerNorm(hidden)
             fusion_dim += hidden
@@ -153,12 +154,10 @@ class SITCL(nn.Module):
             self.topo_norm = None
 
         if self.use_glan_topology:
-            glan_dropout = float(getattr(config, 'glan_dropout', 0.1))
-            glan_local_window = int(getattr(config, 'topology_local_window', 3))
             self.glan_encoder = TargetTopologyEncoder(
                 hidden,
-                dropout=glan_dropout,
-                local_window=glan_local_window,
+                dropout=float(getattr(config, 'glan_dropout', 0.1)),
+                local_window=int(getattr(config, 'topology_local_window', 3)),
                 branches=_parse_glan_branches(config),
             )
             self.glan_norm = nn.LayerNorm(hidden)
@@ -168,64 +167,51 @@ class SITCL(nn.Module):
             self.glan_norm = None
 
         if self.use_knowledge_stance_attention:
-            dropout = float(getattr(config, 'knowledge_dropout', 0.1))
-            self.stance_knowledge_attn = StanceKnowledgeAttention(hidden, bert_dim=768, dropout=dropout)
+            self.stance_knowledge_attn = StanceKnowledgeAttention(
+                hidden, bert_dim=768, dropout=float(getattr(config, 'knowledge_dropout', 0.1)),
+            )
             fusion_dim += hidden
         else:
             self.stance_knowledge_attn = None
 
-        # fc before reply_posterior so random init matches model_3 when posterior is off
         self.fc = nn.Linear(fusion_dim, config.num_classes)
 
-        if self.use_reply_posterior:
+        if self.use_latent_reply:
             reply_dropout = float(getattr(config, 'reply_posterior_dropout', 0.1))
             reply_tau = float(getattr(config, 'reply_posterior_tau', 0.2))
             num_classes = int(getattr(config, 'num_classes', 3))
-            gate_init = float(getattr(config, 'reply_posterior_gate_init', -4.0))
-            self.reply_posterior = ReplyPosteriorDistiller(
+            self.latent_reply = LatentReplyGraph(
                 hidden_dim=hidden,
                 num_classes=num_classes,
                 dropout=reply_dropout,
                 tau=reply_tau,
             )
-            self.reply_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float))
         else:
-            self.reply_posterior = None
-            self.reply_gate = None
+            self.latent_reply = None
 
         logging.info(
-            'model_4 init: context=%s glan=%s knowledge=%s reply_posterior=%s (fusion_dim=%d)',
+            'model_5 init: context=%s glan=%s knowledge=%s latent_reply=%s (fusion_dim=%d)',
             self.use_topology,
             self.use_glan_topology,
             self.use_knowledge_stance_attention,
-            self.use_reply_posterior,
+            self.use_latent_reply,
             fusion_dim,
         )
 
     def set_train_epoch(self, epoch):
         self.train_epoch = int(epoch)
 
-    def _posterior_kl_active(self):
-        return (
-            self.use_reply_posterior
-            and self.training
-            and self.train_epoch >= self.reply_posterior_kl_warmup_epochs - 1
-        )
-
-    def _reply_gate_value(self):
-        if not self.use_reply_posterior or self.reply_gate is None:
+    def _reply_beta(self):
+        if not self.use_latent_reply:
             return 0.0
-
-        max_gate = torch.sigmoid(self.reply_gate) * self.reply_posterior_gate_max
-        if self.training and self.train_epoch < self.reply_posterior_gate_warmup_epochs:
+        ep = self.train_epoch + 1
+        if not self.training:
+            return self.reply_beta_max
+        if ep <= self.reply_beta_zero_epochs:
             return 0.0
-
-        if self.training and self.reply_posterior_gate_ramp_epochs > 0:
-            ramp_start = self.reply_posterior_gate_warmup_epochs
-            progress = (self.train_epoch - ramp_start + 1) / float(self.reply_posterior_gate_ramp_epochs)
-            progress = max(0.0, min(1.0, progress))
-            return (max_gate * progress).item()
-        return max_gate.item()
+        if ep <= self.reply_beta_mid_epochs:
+            return self.reply_beta_mid
+        return self.reply_beta_max
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -238,9 +224,7 @@ class SITCL(nn.Module):
         return weights.to(config.device)
 
     def _encode_knowledge_batch(self, input_ids, input_masks, input_segments):
-        if input_ids is None or input_masks is None:
-            return None
-        if input_masks.sum().item() <= 0:
+        if input_ids is None or input_masks is None or input_masks.sum().item() <= 0:
             return None
         know_out = self.bert(
             input_ids=input_ids,
@@ -299,7 +283,9 @@ class SITCL(nn.Module):
         knowledge_neutral_input_masks = kwargs.get('knowledge_neutral_input_masks')
         knowledge_neutral_input_segments = kwargs.get('knowledge_neutral_input_segments')
 
-        out = self.bert(input_ids=input_ids, attention_mask=input_masks, token_type_ids=input_segments).last_hidden_state
+        out = self.bert(
+            input_ids=input_ids, attention_mask=input_masks, token_type_ids=input_segments,
+        ).last_hidden_state
         h_favor_all = self._encode_knowledge_batch(
             knowledge_favor_input_ids, knowledge_favor_input_masks, knowledge_favor_input_segments,
         )
@@ -312,26 +298,22 @@ class SITCL(nn.Module):
 
         stance = []
         reply_losses = []
-        reply_v_cache = []
-        reply_gate = self._reply_gate_value()
+        reply_beta = self._reply_beta()
 
         for dia_id, (st, ed) in enumerate(dia_idx):
             h = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
             o, _ = self.gru(h.unsqueeze(0))
-            o = o.squeeze(0)
-            v = self.SSE(o, speakers[dia_id])
-            h_sem = self.sem_norm(v[-1])
+            v = self.SSE(o.squeeze(0), speakers[dia_id])
+            h_sem_base = self.sem_norm(v[-1])
 
-            if self.use_reply_posterior and self.reply_posterior is not None and reply_gate > 0:
-                h_sem = self.reply_posterior.blend_final_semantic(h_sem, v, reply_gate)
-                h_sem = self.sem_norm(h_sem)
-
-            if self._posterior_kl_active() and all_label is not None:
-                reply_v_cache.append((v.detach(), dia_id))
-
-            parts = [h_sem]
+            if self.use_latent_reply and self.latent_reply is not None and reply_beta > 0:
+                h_reply = self.latent_reply.prior_reply_vector(v, speakers[dia_id])
+                h_sem = self.reply_fuse_norm(h_sem_base + reply_beta * h_reply)
+            else:
+                h_sem = h_sem_base
 
             graph = topology_graphs[dia_id] if topology_graphs is not None else None
+            parts = [h_sem]
 
             if self.use_topology and self.topology_encoder is not None and graph is not None:
                 topology_v = self.topology_encoder(v, graph)
@@ -353,10 +335,10 @@ class SITCL(nn.Module):
                         knowledge_favor_input_masks[dia_id].sum().item() > 0,
                         knowledge_against_input_masks[dia_id].sum().item() > 0,
                         knowledge_neutral_input_masks[dia_id].sum().item() > 0,
-                    ], device=h_sem.device, dtype=torch.bool)
+                    ], device=h_sem_base.device, dtype=torch.bool)
                     if valid_mask.any():
                         h_know, _ = self.stance_knowledge_attn(
-                            h_sem,
+                            h_sem_base,
                             h_favor_all[dia_id],
                             h_against_all[dia_id],
                             h_neutral_all[dia_id],
@@ -364,26 +346,37 @@ class SITCL(nn.Module):
                         )
                         parts.append(h_know)
 
-            final_state = self._concat_features(parts)
-            stance.append(final_state)
+            stance.append(self._concat_features(parts))
 
-        stance = torch.stack(stance)
-        logits = self.fc(stance)
-        loss = self.criterion(logits, label)
-
-        if self._posterior_kl_active() and all_label is not None:
-            for v_det, dia_id in reply_v_cache:
-                turn_labels = self._all_labels_tensor(all_label, dia_id, v_det.size(0), v_det.device)
-                losses = self.reply_posterior.distillation_losses(v_det, turn_labels)
+            if self.use_latent_reply and self.training and all_label is not None:
+                turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
+                parents = _graph_field(graph, 'reply_parent')
+                confidences = _graph_field(graph, 'reply_confidence')
+                losses = self.latent_reply.distillation_losses(
+                    v.detach(),
+                    turn_labels,
+                    speakers[dia_id],
+                    reply_parents=parents,
+                    reply_confidences=confidences,
+                    reply_conf_threshold=self.reply_conf_threshold,
+                    kl_final_row_weight=self.reply_kl_final_row_weight,
+                    kl_full_weight=self.reply_kl_full_weight,
+                )
                 if losses is not None:
                     reply_losses.append(losses)
 
+        logits = self.fc(torch.stack(stance))
+        loss = self.criterion(logits, label)
+
         if reply_losses:
             distill_kl = torch.stack([item['distill_kl'] for item in reply_losses]).mean()
-            label_ce = torch.stack([item['label_ce'] for item in reply_losses]).mean()
-            if torch.isfinite(distill_kl) and self.reply_posterior_lambda_distill > 0:
-                loss = loss + self.reply_posterior_lambda_distill * distill_kl
-            if torch.isfinite(label_ce) and self.reply_posterior_label_ce_weight > 0:
-                loss = loss + self.reply_posterior_label_ce_weight * label_ce
+            if torch.isfinite(distill_kl) and self.reply_kl_lambda > 0:
+                loss = loss + self.reply_kl_lambda * distill_kl
+            if self.reply_pseudo_lambda > 0:
+                pseudo_items = [item['reply_ce'] for item in reply_losses if 'reply_ce' in item]
+                if pseudo_items:
+                    reply_ce = torch.stack(pseudo_items).mean()
+                    if torch.isfinite(reply_ce):
+                        loss = loss + self.reply_pseudo_lambda * reply_ce
 
         return loss, logits, label
