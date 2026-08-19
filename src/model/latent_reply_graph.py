@@ -38,6 +38,33 @@ def _rowwise_kl(student_probs, teacher_probs, rows=None):
     return torch.stack(losses).mean()
 
 
+def _pseudo_reply_ce(prob_matrix, reply_parents, reply_confidences, threshold, device):
+    if reply_parents is None or prob_matrix.numel() == 0:
+        return None
+
+    reply_ce = prob_matrix.new_zeros(())
+    count = 0
+    num_turns = prob_matrix.size(0)
+    for i in range(num_turns):
+        if i >= len(reply_parents):
+            continue
+        parent = int(reply_parents[i])
+        conf = 1.0
+        if reply_confidences is not None and i < len(reply_confidences):
+            conf = float(reply_confidences[i])
+        if conf < threshold or parent < 0:
+            continue
+        target_col = parent if 0 <= parent <= i else i
+        row = prob_matrix[i, : i + 1].clamp_min(1e-12)
+        row = row / row.sum()
+        target = torch.tensor(target_col, device=device)
+        reply_ce = reply_ce + F.nll_loss(row.log(), target) * conf
+        count += 1
+    if count == 0:
+        return None
+    return reply_ce / count
+
+
 class PairReplyScorer(nn.Module):
     """Independent Q/K-style pair scorer; diagonal uses separate root MLP (not h·h)."""
 
@@ -171,26 +198,16 @@ class LatentReplyGraph(nn.Module):
 
         losses = {'distill_kl': distill_kl}
 
-        if reply_parents is not None:
-            reply_ce = turns.new_zeros(())
-            count = 0
-            num_turns = turns.size(0)
-            for i in range(num_turns):
-                if reply_parents is None or i >= len(reply_parents):
-                    continue
-                parent = int(reply_parents[i])
-                conf = 1.0
-                if reply_confidences is not None and i < len(reply_confidences):
-                    conf = float(reply_confidences[i])
-                if conf < reply_conf_threshold or parent < 0:
-                    continue
-                target_col = parent if 0 <= parent <= i else i
-                row = prior[i, : i + 1].clamp_min(1e-12)
-                row = row / row.sum()
-                target = torch.tensor(target_col, device=turns.device)
-                reply_ce = reply_ce + F.nll_loss(row.log(), target) * conf
-                count += 1
-            if count > 0:
-                losses['reply_ce'] = reply_ce / count
+        post_ce = _pseudo_reply_ce(
+            post, reply_parents, reply_confidences, reply_conf_threshold, turns.device,
+        )
+        if post_ce is not None:
+            losses['post_reply_ce'] = post_ce
+
+        prior_ce = _pseudo_reply_ce(
+            prior, reply_parents, reply_confidences, reply_conf_threshold, turns.device,
+        )
+        if prior_ce is not None:
+            losses['reply_ce'] = prior_ce
 
         return losses

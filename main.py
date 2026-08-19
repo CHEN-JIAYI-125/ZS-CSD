@@ -83,13 +83,32 @@ class Main:
         self.load_param()
         logging.info('Switched training stage to %s at epoch %d', stage, epoch + 1)
 
+    def _clip_gradients(self):
+        max_norm = self.config.max_grad_norm
+        if not hasattr(self.model, 'latent_reply') or self.model.latent_reply is None:
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+            return
+        backbone = []
+        reply = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            if name.startswith('latent_reply.'):
+                reply.append(param)
+            else:
+                backbone.append(param)
+        if backbone:
+            nn.utils.clip_grad_norm_(backbone, max_norm)
+        if reply:
+            nn.utils.clip_grad_norm_(reply, max_norm)
+
     def train_iter(self):
         self.model.train()
         running_loss = 0.0
         for data in tqdm(self.trainLoader):
             loss, _, _ = self.model(**data)
             loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self._clip_gradients()
             self.optimizer.step()
             self.scheduler.step()
             self.model.zero_grad()
@@ -137,6 +156,8 @@ class Main:
             if hasattr(self.model, 'set_train_epoch'):
                 self.model.set_train_epoch(epoch)
             train_loss = self.train_iter()
+            if hasattr(self.model, 'set_train_epoch'):
+                self.model.set_train_epoch(epoch)
             dev_macro_f1, dev_loss, favor_f1, against_f1, neutral_f1, _, dev_acc = self.evaluate_iter(mode='dev')
 
             log_msg = (
@@ -174,6 +195,9 @@ class Main:
                 torch.load(best_ckpt, map_location=self.config.device),
             )
             logging.info('Loaded best dev checkpoint from epoch %d', self.best_epoch)
+
+        if hasattr(self.model, 'set_train_epoch'):
+            self.model.set_train_epoch(max(0, int(self.best_epoch) - 1))
 
         test_macro_f1, test_loss, favor_f1, against_f1, neutral_f1, _, test_acc = self.evaluate_iter(mode='test')
         logging.info(

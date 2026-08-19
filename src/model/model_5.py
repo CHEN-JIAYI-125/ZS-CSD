@@ -120,6 +120,7 @@ class SITCL(nn.Module):
         )
         self.reply_kl_lambda = float(getattr(config, 'reply_kl_lambda', 0.05))
         self.reply_pseudo_lambda = float(getattr(config, 'reply_pseudo_lambda', 0.02))
+        self.reply_post_lambda = float(getattr(config, 'reply_post_lambda', 0.02))
         self.reply_conf_threshold = float(getattr(config, 'reply_conf_threshold', 0.7))
         self.reply_kl_final_row_weight = float(getattr(config, 'reply_kl_final_row_weight', 1.0))
         self.reply_kl_full_weight = float(getattr(config, 'reply_kl_full_weight', 0.5))
@@ -202,16 +203,19 @@ class SITCL(nn.Module):
         self.train_epoch = int(epoch)
 
     def _reply_beta(self):
+        """Same beta for train and eval; driven only by train_epoch (set before train/dev each epoch)."""
         if not self.use_latent_reply:
             return 0.0
         ep = self.train_epoch + 1
-        if not self.training:
-            return self.reply_beta_max
         if ep <= self.reply_beta_zero_epochs:
             return 0.0
         if ep <= self.reply_beta_mid_epochs:
             return self.reply_beta_mid
         return self.reply_beta_max
+
+    def _reply_aux_active(self):
+        """No reply KL/CE while beta=0 — epoch 1-2 matches v3 baseline path."""
+        return (self.train_epoch + 1) > self.reply_beta_zero_epochs
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -348,7 +352,12 @@ class SITCL(nn.Module):
 
             stance.append(self._concat_features(parts))
 
-            if self.use_latent_reply and self.training and all_label is not None:
+            if (
+                self.use_latent_reply
+                and self.training
+                and all_label is not None
+                and self._reply_aux_active()
+            ):
                 turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
                 parents = _graph_field(graph, 'reply_parent')
                 confidences = _graph_field(graph, 'reply_confidence')
@@ -372,6 +381,12 @@ class SITCL(nn.Module):
             distill_kl = torch.stack([item['distill_kl'] for item in reply_losses]).mean()
             if torch.isfinite(distill_kl) and self.reply_kl_lambda > 0:
                 loss = loss + self.reply_kl_lambda * distill_kl
+            if self.reply_post_lambda > 0:
+                post_items = [item['post_reply_ce'] for item in reply_losses if 'post_reply_ce' in item]
+                if post_items:
+                    post_ce = torch.stack(post_items).mean()
+                    if torch.isfinite(post_ce):
+                        loss = loss + self.reply_post_lambda * post_ce
             if self.reply_pseudo_lambda > 0:
                 pseudo_items = [item['reply_ce'] for item in reply_losses if 'reply_ce' in item]
                 if pseudo_items:
