@@ -68,14 +68,14 @@ use_latent_reply: 1
 use_reply_posterior: 0  # legacy v4 gate; keep 0 when using model_5
 reply_posterior_tau: 0.2
 reply_posterior_dropout: 0.1
-reply_kl_lambda: 0.01
+reply_kl_lambda: 0.0
 reply_kl_start_epoch: 6   # ep3-5: post/prior CE only; KL from ep6
-reply_post_lambda: 0.02   # trains posterior teacher via high-conf pseudo-parent CE
-reply_pseudo_lambda: 0.02 # trains prior via pseudo-parent CE
+reply_post_lambda: 0.0   # trains posterior teacher via high-conf pseudo-parent CE
+reply_pseudo_lambda: 0.0 # trains prior via pseudo-parent CE
 reply_conf_threshold: 0.7
 reply_kl_final_row_weight: 1.0
 reply_kl_full_weight: 0.5
-reply_beta_zero_epochs: 2   # ep1-2: beta=0, no reply aux (v3); ep3-5: beta=0.02; ep6+: 0.05
+reply_beta_zero_epochs: 999   # ep1-2: beta=0, no reply aux (v3); ep3-5: beta=0.02; ep6+: 0.05
 reply_beta_mid_epochs: 5
 reply_beta_mid: 0.02
 reply_beta_max: 0.05
