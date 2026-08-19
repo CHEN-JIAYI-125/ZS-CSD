@@ -709,7 +709,12 @@ class DataProcessor():
                     'knowledge_favor_tokens', 'knowledge_against_tokens', 'knowledge_neutral_tokens',
                 ]
             ]
-            all_label = document.get('all_label', [label] * len(sentences))
+            if bool(getattr(self.config, 'use_latent_reply', 0)):
+                if 'all_label' not in document:
+                    raise ValueError(f'id={doc_id} missing all_label (required when use_latent_reply=1)')
+                all_label = document['all_label']
+            else:
+                all_label = document.get('all_label', [label] * len(sentences))
             if len(all_label) != len(sentences):
                 raise ValueError(f'id={doc_id} all_label length must match sentences length')
             input_ids = list(map(self.tokenizer.convert_tokens_to_ids, sentences))
@@ -819,7 +824,15 @@ class DataProcessor():
             train_dataset = MyDataset(self.forward('train'))
             dev_dataset = MyDataset(self.forward('dev'))
             test_dataset = MyDataset(self.forward('test'))
-        train_loader = DataLoader(train_dataset, batch_size=self.config.batchsize, shuffle=True, collate_fn=self.collate_fn_new)
+        train_gen = torch.Generator()
+        train_gen.manual_seed(int(getattr(self.config, 'seed', 1234)))
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batchsize,
+            shuffle=True,
+            collate_fn=self.collate_fn_new,
+            generator=train_gen,
+        )
         dev_loader = DataLoader(dev_dataset, batch_size=self.config.batchsize, shuffle=False, collate_fn=self.collate_fn_new)
         test_loader = DataLoader(test_dataset, batch_size=self.config.batchsize, shuffle=False, collate_fn=self.collate_fn_new)
         return train_loader, dev_loader, test_loader

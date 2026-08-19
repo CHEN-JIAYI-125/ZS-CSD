@@ -160,20 +160,23 @@ class LatentReplyGraph(nn.Module):
     def posterior_matrix(self, turns, gold_labels, speakers):
         return self.posterior_scorer.forward_matrix(turns, gold_labels, speakers, self.tau)
 
-    def aggregate_reply(self, turns, reply_weights):
-        if turns.size(0) == 0 or reply_weights.numel() == 0:
-            device = turns.device if turns.numel() else reply_weights.device
-            dtype = turns.dtype if turns.numel() else reply_weights.dtype
-            return self.pool_norm(torch.zeros(self.hidden_dim, device=device, dtype=dtype))
-        pool = torch.matmul(reply_weights.unsqueeze(0), turns).squeeze(0)
+    def aggregate_history(self, history_turns, history_weights):
+        """Pool history utterances only (ROOT slot excluded)."""
+        if history_turns.size(0) == 0 or history_weights.numel() == 0:
+            device = history_turns.device
+            dtype = history_turns.dtype
+            return torch.zeros(self.hidden_dim, device=device, dtype=dtype)
+        pool = torch.matmul(history_weights.unsqueeze(0), history_turns).squeeze(0)
         return self.pool_norm(self.reply_proj(pool))
 
     def prior_reply_vector(self, turns, speakers):
         if turns.size(0) <= 1:
-            return self.aggregate_reply(turns[:0], turns.new_zeros(0))
+            return torch.zeros(self.hidden_dim, device=turns.device, dtype=turns.dtype)
+
         prior = self.prior_matrix(turns, speakers)
-        weights = prior[-1, : turns.size(0)]
-        return self.aggregate_reply(turns, weights)
+        # Last column is ROOT (no parent); do not aggregate current utterance into h_reply.
+        history_weights = prior[-1, :-1]
+        return self.aggregate_history(turns[:-1], history_weights)
 
     def distillation_losses(
         self,

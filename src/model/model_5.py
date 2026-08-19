@@ -118,7 +118,7 @@ class SITCL(nn.Module):
         self.use_latent_reply = bool(
             getattr(config, 'use_latent_reply', getattr(config, 'use_reply_posterior', 0))
         )
-        self.reply_kl_lambda = float(getattr(config, 'reply_kl_lambda', 0.05))
+        self.reply_kl_lambda = float(getattr(config, 'reply_kl_lambda', 0.01))
         self.reply_pseudo_lambda = float(getattr(config, 'reply_pseudo_lambda', 0.02))
         self.reply_post_lambda = float(getattr(config, 'reply_post_lambda', 0.02))
         self.reply_conf_threshold = float(getattr(config, 'reply_conf_threshold', 0.7))
@@ -126,8 +126,9 @@ class SITCL(nn.Module):
         self.reply_kl_full_weight = float(getattr(config, 'reply_kl_full_weight', 0.5))
         self.reply_beta_zero_epochs = int(getattr(config, 'reply_beta_zero_epochs', 2))
         self.reply_beta_mid_epochs = int(getattr(config, 'reply_beta_mid_epochs', 5))
-        self.reply_beta_mid = float(getattr(config, 'reply_beta_mid', 0.05))
-        self.reply_beta_max = float(getattr(config, 'reply_beta_max', 0.10))
+        self.reply_beta_mid = float(getattr(config, 'reply_beta_mid', 0.02))
+        self.reply_beta_max = float(getattr(config, 'reply_beta_max', 0.05))
+        self.reply_kl_start_epoch = int(getattr(config, 'reply_kl_start_epoch', 6))
         self.train_epoch = 0
 
         hidden = config.gru_hidden
@@ -214,8 +215,12 @@ class SITCL(nn.Module):
         return self.reply_beta_max
 
     def _reply_aux_active(self):
-        """No reply KL/CE while beta=0 — epoch 1-2 matches v3 baseline path."""
+        """Epoch 1-2: no reply aux loss (true v3 backbone)."""
         return (self.train_epoch + 1) > self.reply_beta_zero_epochs
+
+    def _reply_kl_active(self):
+        """Posterior CE first; KL only after teacher has warmed up."""
+        return (self.train_epoch + 1) >= self.reply_kl_start_epoch
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -378,9 +383,10 @@ class SITCL(nn.Module):
         loss = self.criterion(logits, label)
 
         if reply_losses:
-            distill_kl = torch.stack([item['distill_kl'] for item in reply_losses]).mean()
-            if torch.isfinite(distill_kl) and self.reply_kl_lambda > 0:
-                loss = loss + self.reply_kl_lambda * distill_kl
+            if self._reply_kl_active():
+                distill_kl = torch.stack([item['distill_kl'] for item in reply_losses]).mean()
+                if torch.isfinite(distill_kl) and self.reply_kl_lambda > 0:
+                    loss = loss + self.reply_kl_lambda * distill_kl
             if self.reply_post_lambda > 0:
                 post_items = [item['post_reply_ce'] for item in reply_losses if 'post_reply_ce' in item]
                 if post_items:
