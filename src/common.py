@@ -70,3 +70,40 @@ def target_CL(H_lst, target, config):
     labels = labels.to(config.device)
     loss = F.cross_entropy(similarities, labels)
     return loss
+
+
+def alllabel_supcon_loss(vectors, stance_labels, target_ids, tau=0.07, cross_target_weight=0.5):
+    """
+    PPED-style SupCon over all utterances in a batch.
+    Positive: same stance; weight 1.0 if same target else cross_target_weight.
+    """
+    if vectors.size(0) <= 1:
+        return vectors.new_zeros(())
+
+    z = F.normalize(vectors, p=2, dim=-1)
+    sim = torch.mm(z, z.t()) / max(tau, 1e-4)
+    num = z.size(0)
+    eye = torch.eye(num, device=vectors.device, dtype=torch.bool)
+
+    same_stance = stance_labels.unsqueeze(0) == stance_labels.unsqueeze(1)
+    same_target = target_ids.unsqueeze(0) == target_ids.unsqueeze(1)
+    pos_mask = same_stance & ~eye
+    pos_weight = torch.where(
+        same_target,
+        torch.ones_like(sim),
+        torch.full_like(sim, cross_target_weight),
+    )
+
+    losses = []
+    for i in range(num):
+        pos_i = pos_mask[i]
+        if not pos_i.any():
+            continue
+        exp_sim = torch.exp(sim[i]).masked_fill(eye[i], 0.0)
+        denom = exp_sim.sum().clamp_min(1e-12)
+        numer = (exp_sim * pos_weight[i] * pos_i.float()).sum().clamp_min(1e-12)
+        losses.append(-torch.log(numer / denom))
+
+    if not losses:
+        return vectors.new_zeros(())
+    return torch.stack(losses).mean()

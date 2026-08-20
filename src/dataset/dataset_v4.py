@@ -709,14 +709,15 @@ class DataProcessor():
                     'knowledge_favor_tokens', 'knowledge_against_tokens', 'knowledge_neutral_tokens',
                 ]
             ]
-            if bool(getattr(self.config, 'use_latent_reply', 0)):
-                if 'all_label' not in document:
-                    raise ValueError(f'id={doc_id} missing all_label (required when use_latent_reply=1)')
-                all_label = document['all_label']
-            else:
-                all_label = document.get('all_label', [label] * len(sentences))
+            if 'all_label' not in document:
+                raise ValueError(f'id={doc_id} missing all_label in JSON (no fallback)')
+            all_label = document['all_label']
             if len(all_label) != len(sentences):
                 raise ValueError(f'id={doc_id} all_label length must match sentences length')
+            if int(all_label[-1]) != int(label):
+                raise ValueError(
+                    f'id={doc_id} all_label[-1]={all_label[-1]} must equal final label={label}'
+                )
             input_ids = list(map(self.tokenizer.convert_tokens_to_ids, sentences))
             input_masks = [[1] * len(w) for w in input_ids]
             input_segments = [[0] * len(w) for w in input_ids]

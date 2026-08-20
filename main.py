@@ -85,22 +85,27 @@ class Main:
 
     def _clip_gradients(self):
         max_norm = self.config.max_grad_norm
-        if not hasattr(self.model, 'latent_reply') or self.model.latent_reply is None:
+        aux_prefixes = ('latent_reply.', 'pped_evidence.')
+        has_aux = any(
+            hasattr(self.model, name) and getattr(self.model, name) is not None
+            for name in ('latent_reply', 'pped_evidence')
+        )
+        if not has_aux:
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
             return
         backbone = []
-        reply = []
+        aux = []
         for name, param in self.model.named_parameters():
             if not param.requires_grad or param.grad is None:
                 continue
-            if name.startswith('latent_reply.'):
-                reply.append(param)
+            if name.startswith(aux_prefixes):
+                aux.append(param)
             else:
                 backbone.append(param)
         if backbone:
             nn.utils.clip_grad_norm_(backbone, max_norm)
-        if reply:
-            nn.utils.clip_grad_norm_(reply, max_norm)
+        if aux:
+            nn.utils.clip_grad_norm_(aux, max_norm)
 
     def train_iter(self):
         self.model.train()
