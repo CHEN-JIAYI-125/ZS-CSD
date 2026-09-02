@@ -1,4 +1,4 @@
-# data path 
+﻿# data path 
 train_path: data/train_data.json
 dev_path: data/dev_data.json
 test_path: data/test_data.json
@@ -30,8 +30,10 @@ sse_dropout: 0.2
 label_smoothing: 0.05
 alpha: 0  # target_CL removed from model_3; kept for v0-v2 compatibility
 
-# episode hypergraph (v2): reply-chain + interaction events
+# SSE speaker hypergraph (model_5): 1=on (default), 0=ablation (intra only)
 use_speaker_hypergraph: 1
+
+# episode hypergraph (v2 legacy; model_2 only)
 use_reply_chain_hyperedge: 1
 use_interaction_hyperedge: 1
 reply_hypergraph_depth: 2

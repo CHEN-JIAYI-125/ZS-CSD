@@ -39,17 +39,26 @@ class Attention(nn.Module):
 
 
 class SSE(nn.Module):
-    def __init__(self, hidden_dim=768, dropout=0.2):
+    """Speaker-aware encoding: intra dialogue attention + optional speaker hypergraph inter."""
+
+    def __init__(self, hidden_dim=768, dropout=0.2, use_speaker_hypergraph=True):
         super().__init__()
+        self.use_speaker_hypergraph = use_speaker_hypergraph
         self.linear_intra = nn.Linear(hidden_dim * 2, hidden_dim)
         self.attention_intra = Attention(hidden_dim)
-        self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
+        if use_speaker_hypergraph:
+            self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
+        else:
+            self.speaker_hypergraph = None
 
     def forward(self, utterances, speakers):
         device = utterances.device
         speakers_mapped = map_sequence(speakers)
         speaker_ids = torch.tensor(speakers_mapped, device=device)
-        inter_all = self.speaker_hypergraph(utterances, speaker_ids)
+        if self.use_speaker_hypergraph and self.speaker_hypergraph is not None:
+            inter_all = self.speaker_hypergraph(utterances, speaker_ids)
+        else:
+            inter_all = None
 
         v_lst = []
         last_speaker_idx = {}
@@ -63,7 +72,10 @@ class SSE(nn.Module):
                 q_intra = self.linear_intra(vh_concat)
                 context = utterances[: i + 1]
                 v_intra = self.attention_intra(q_intra, context, context)
-                v_lst.append(v_intra + inter_all[i])
+                if inter_all is not None:
+                    v_lst.append(v_intra + inter_all[i])
+                else:
+                    v_lst.append(v_intra)
             last_speaker_idx[speaker_id] = i
         return torch.stack(v_lst)
 
@@ -105,6 +117,8 @@ class SITCL(nn.Module):
             or getattr(config, 'use_knowledge_gate', 0)
         )
         self.use_alllabel_supcon = bool(getattr(config, 'use_alllabel_supcon', 0))
+        self.use_speaker_hypergraph = bool(getattr(config, 'use_speaker_hypergraph', 1))
+        self.use_target_knowledge = bool(getattr(config, 'use_target_knowledge', 1))
         self.alllabel_supcon_lambda = float(getattr(config, 'alllabel_supcon_lambda', 0.05))
         self.alllabel_supcon_tau = float(getattr(config, 'alllabel_supcon_tau', 0.07))
         self.cross_target_positive_weight = float(getattr(config, 'cross_target_positive_weight', 0.5))
@@ -129,7 +143,11 @@ class SITCL(nn.Module):
         self.criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=label_smoothing)
 
         dropout = float(getattr(config, 'sse_dropout', 0.2))
-        self.SSE = SSE(hidden_dim=hidden, dropout=dropout)
+        self.SSE = SSE(
+            hidden_dim=hidden,
+            dropout=dropout,
+            use_speaker_hypergraph=self.use_speaker_hypergraph,
+        )
         self.sem_norm = nn.LayerNorm(hidden)
         self.target_proj = nn.Linear(768, hidden)
 
@@ -181,10 +199,13 @@ class SITCL(nn.Module):
             self.pped_evidence = None
 
         logging.info(
-            'model_5 init: context=%s glan=%s knowledge=%s supcon=%s pped_evidence=%s (fusion_dim=%d)',
+            'model_5 init: context=%s glan=%s target_knowledge=%s knowledge_attn=%s '
+            'speaker_hypergraph=%s supcon=%s pped_evidence=%s (fusion_dim=%d)',
             self.use_topology,
             self.use_glan_topology,
+            self.use_target_knowledge,
             self.use_knowledge_stance_attention,
+            self.use_speaker_hypergraph,
             self.use_alllabel_supcon,
             self.use_pped_evidence,
             fusion_dim,
@@ -337,6 +358,7 @@ class SITCL(nn.Module):
                 parts.append(self.glan_norm(h_glan))
 
             if self.use_knowledge_stance_attention and self.stance_knowledge_attn is not None:
+                h_know = torch.zeros_like(h_sem)
                 if (
                     h_favor_all is not None
                     and h_against_all is not None
@@ -356,7 +378,7 @@ class SITCL(nn.Module):
                             h_neutral_all[dia_id],
                             valid_mask=valid_mask,
                         )
-                        parts.append(h_know)
+                parts.append(h_know)
 
             stance.append(self._concat_features(parts))
 

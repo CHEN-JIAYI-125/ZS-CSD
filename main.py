@@ -107,6 +107,16 @@ class Main:
         if aux:
             nn.utils.clip_grad_norm_(aux, max_norm)
 
+    def _print_f1(self, prefix, macro_f1, favor, against, neutral, loss=None):
+        parts = [prefix]
+        if loss is not None:
+            parts.append(f'Loss: {loss:.2f}')
+        parts.append(
+            f'Macro F1: {100 * macro_f1:.2f} | '
+            f'Favor: {100 * favor:.2f} | Against: {100 * against:.2f} | Neutral: {100 * neutral:.2f}'
+        )
+        print(' | '.join(parts))
+
     def train_iter(self):
         self.model.train()
         running_loss = 0.0
@@ -170,6 +180,10 @@ class Main:
                 % (epoch + 1, train_loss, dev_loss, 100 * dev_macro_f1)
             )
             logging.info(log_msg)
+            self._print_f1(
+                f'Epoch {epoch + 1} Dev',
+                dev_macro_f1, favor_f1, against_f1, neutral_f1, loss=dev_loss,
+            )
 
             if dev_macro_f1 > best_dev_f1 + 1e-4:
                 best_dev_f1 = dev_macro_f1
@@ -177,11 +191,15 @@ class Main:
                 self.best_epoch = epoch + 1
                 self.best_dev_macro_f1 = best_dev_f1
                 torch.save(self.model.state_dict(), best_ckpt)
-                test_macro_f1, test_loss, _, _, _, _, _ = self.evaluate_iter(mode='test')
+                test_macro_f1, test_loss, test_favor, test_against, test_neutral, _, _ = self.evaluate_iter(mode='test')
                 logging.info(
                     'Test Loss: %.2f, Test Macro F1: %.2f',
                     test_loss,
                     100 * test_macro_f1,
+                )
+                self._print_f1(
+                    f'Epoch {epoch + 1} Test (best dev)',
+                    test_macro_f1, test_favor, test_against, test_neutral, loss=test_loss,
                 )
             else:
                 stale_epochs += 1
@@ -209,6 +227,10 @@ class Main:
             'Test Loss: %.2f, Test Macro F1: %.2f',
             test_loss,
             100 * test_macro_f1,
+        )
+        self._print_f1(
+            f'Final Test (best epoch {self.best_epoch})',
+            test_macro_f1, favor_f1, against_f1, neutral_f1, loss=test_loss,
         )
 
     def load_param(self):
