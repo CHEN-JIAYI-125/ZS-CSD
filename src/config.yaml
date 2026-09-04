@@ -31,7 +31,7 @@ label_smoothing: 0.05
 alpha: 0  # target_CL removed from model_3; kept for v0-v2 compatibility
 
 # SSE speaker hypergraph (model_5): 1=on (default), 0=ablation (intra only)
-use_speaker_hypergraph: 0
+use_speaker_hypergraph: 1
 
 # episode hypergraph (v2 legacy; model_2 only)
 use_reply_chain_hyperedge: 1
@@ -77,7 +77,7 @@ use_alllabel_supcon: 0
 alllabel_supcon_lambda: 0.05
 alllabel_supcon_tau: 0.07
 cross_target_positive_weight: 0.5
-use_pped_evidence: 1
+use_pped_evidence: 0
 use_latent_reply: 0
 use_reply_posterior: 0
 evidence_gamma: 0.05
