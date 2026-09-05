@@ -18,8 +18,8 @@ adam_epsilon: 1e-8
 warmup_steps: 0
 
 # topology — context graph + optional GLAN heterograph (speaker hypergraph lives in SSE)
-use_topology: 0
-use_glan_topology: 1
+use_topology: 1
+use_glan_topology: 0
 topology_local_window: 3
 glan_dropout: 0.1
 glan_branches: global,local,struct,final
