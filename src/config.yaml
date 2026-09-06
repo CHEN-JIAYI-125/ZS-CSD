@@ -67,16 +67,20 @@ knowledge_dropout: 0.1
 
 # Experiment B (model_4): all_label SupCon only — no inference change
 # use_alllabel_supcon: 1
-# alllabel_supcon_lambda: 0.05
+# alllabel_supcon_lambda: 0.03
+# alllabel_supcon_tau: 0.10
+# alllabel_supcon_proj_dim: 256
+# cross_target_positive_weight: 1.0
 # use_pped_evidence: 0
-# use_latent_reply: 0
 # Switch src/model/__init__.py to model_4 for Exp B.
+# SupCon is active from epoch 1 (no delayed warmup).
 
 # Experiment C (model_5): SupCon + PPED evidence distillation
 use_alllabel_supcon: 0
-alllabel_supcon_lambda: 0.05
-alllabel_supcon_tau: 0.07
-cross_target_positive_weight: 0.5
+alllabel_supcon_lambda: 0.03
+alllabel_supcon_tau: 0.10
+alllabel_supcon_proj_dim: 256
+cross_target_positive_weight: 1.0
 use_pped_evidence: 0
 use_latent_reply: 0
 use_reply_posterior: 0

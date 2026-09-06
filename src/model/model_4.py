@@ -96,7 +96,7 @@ class StanceKnowledgeAttention(nn.Module):
 
 
 class SITCL(nn.Module):
-    """Experiment B: v3-identical inference + PPED-style all_label SupCon (train only)."""
+    """Experiment B: v3-identical inference + all_label SupCon on fused turn features (train only, epoch 1+)."""
 
     def __init__(self, config):
         super().__init__()
@@ -157,12 +157,24 @@ class SITCL(nn.Module):
             self.stance_knowledge_attn = None
 
         self.fc = nn.Linear(fusion_dim, config.num_classes)
+        self.fusion_dim = fusion_dim
+        if self.use_alllabel_supcon:
+            proj_dim = int(getattr(config, 'alllabel_supcon_proj_dim', 256))
+            self.supcon_proj = nn.Sequential(
+                nn.Linear(fusion_dim, proj_dim),
+                nn.LayerNorm(proj_dim),
+            )
+        else:
+            self.supcon_proj = None
         logging.info(
-            'model_4 init: context=%s glan=%s knowledge=%s alllabel_supcon=%s (fusion_dim=%d)',
+            'model_4 init: context=%s glan=%s knowledge=%s alllabel_supcon=%s '
+            'lambda=%.3f tau=%.3f (fusion_dim=%d, supcon_from_epoch=1)',
             self.use_topology,
             self.use_glan_topology,
             self.use_knowledge_stance_attention,
             self.use_alllabel_supcon,
+            self.alllabel_supcon_lambda,
+            self.alllabel_supcon_tau,
             fusion_dim,
         )
 
@@ -215,13 +227,59 @@ class SITCL(nn.Module):
             return labels[:num_turns].to(device=device, dtype=torch.long)
         return torch.tensor(labels[:num_turns], device=device, dtype=torch.long)
 
-    def _collect_supcon(self, supcon_vectors, supcon_stances, supcon_target_ids, target_to_id, v, turn_labels, target_str):
+    def _knowledge_vector(self, h_sem, dia_id, h_favor_all, h_against_all, h_neutral_all, favor_masks, against_masks, neutral_masks):
+        if self.stance_knowledge_attn is None:
+            return None
+        if (
+            h_favor_all is None
+            or h_against_all is None
+            or h_neutral_all is None
+            or dia_id >= h_favor_all.size(0)
+        ):
+            return torch.zeros_like(h_sem)
+        valid_mask = torch.tensor([
+            favor_masks[dia_id].sum().item() > 0,
+            against_masks[dia_id].sum().item() > 0,
+            neutral_masks[dia_id].sum().item() > 0,
+        ], device=h_sem.device, dtype=torch.bool)
+        if not valid_mask.any():
+            return torch.zeros_like(h_sem)
+        h_know, _ = self.stance_knowledge_attn(
+            h_sem,
+            h_favor_all[dia_id],
+            h_against_all[dia_id],
+            h_neutral_all[dia_id],
+            valid_mask=valid_mask,
+        )
+        return h_know
+
+    def _fused_turn_vector(self, h_sem_turn, topology_v, turn_id, h_glan, h_know):
+        parts = [h_sem_turn]
+        if self.use_topology and topology_v is not None:
+            parts.append(self.topo_norm(topology_v[turn_id]))
+        if self.use_glan_topology and h_glan is not None:
+            parts.append(self.glan_norm(h_glan))
+        if self.use_knowledge_stance_attention and self.stance_knowledge_attn is not None:
+            parts.append(h_know if h_know is not None else torch.zeros_like(h_sem_turn))
+        return self._concat_features(parts)
+
+    def _collect_supcon_turns(
+        self,
+        supcon_vectors,
+        supcon_stances,
+        supcon_target_ids,
+        target_to_id,
+        turn_vectors,
+        turn_labels,
+        target_str,
+    ):
         if target_str not in target_to_id:
             target_to_id[target_str] = len(target_to_id)
         tid = target_to_id[target_str]
-        supcon_vectors.append(v)
-        supcon_stances.append(turn_labels)
-        supcon_target_ids.extend([tid] * v.size(0))
+        for turn_id, turn_vec in enumerate(turn_vectors):
+            supcon_vectors.append(turn_vec)
+            supcon_stances.append(int(turn_labels[turn_id].item()))
+            supcon_target_ids.append(tid)
 
     def forward(self, **kwargs):
         input_ids = kwargs['input_ids']
@@ -268,51 +326,62 @@ class SITCL(nn.Module):
             h = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
             o, _ = self.gru(h.unsqueeze(0))
             v = self.SSE(o.squeeze(0), speakers[dia_id])
+            graph = topology_graphs[dia_id] if topology_graphs is not None else None
+
+            topology_v = None
+            if self.use_topology and self.topology_encoder is not None and graph is not None:
+                topology_v = self.topology_encoder(v, graph)
+
+            h_glan = None
+            if self.use_glan_topology and self.glan_encoder is not None and graph is not None:
+                target_repr = self._extract_target_repr(out, st, ed, target_idx, dia_id)
+                _, h_glan, _, _ = self.glan_encoder(v, target_repr, graph)
+
             h_sem = self.sem_norm(v[-1])
+            h_know_last = self._knowledge_vector(
+                h_sem,
+                dia_id,
+                h_favor_all,
+                h_against_all,
+                h_neutral_all,
+                knowledge_favor_input_masks,
+                knowledge_against_input_masks,
+                knowledge_neutral_input_masks,
+            )
+            stance.append(
+                self._fused_turn_vector(h_sem, topology_v, v.size(0) - 1, h_glan, h_know_last),
+            )
 
             if self.use_alllabel_supcon and self.training and all_label is not None:
                 turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
                 target_str = str(targets[dia_id]) if dia_id < len(targets) else str(dia_id)
-                self._collect_supcon(
-                    supcon_vectors, supcon_stances, supcon_target_ids,
-                    target_to_id, v, turn_labels, target_str,
+                turn_vectors = []
+                for turn_id in range(v.size(0)):
+                    h_sem_turn = self.sem_norm(v[turn_id])
+                    h_know_turn = self._knowledge_vector(
+                        h_sem_turn,
+                        dia_id,
+                        h_favor_all,
+                        h_against_all,
+                        h_neutral_all,
+                        knowledge_favor_input_masks,
+                        knowledge_against_input_masks,
+                        knowledge_neutral_input_masks,
+                    )
+                    turn_vectors.append(
+                        self._fused_turn_vector(
+                            h_sem_turn, topology_v, turn_id, h_glan, h_know_turn,
+                        ),
+                    )
+                self._collect_supcon_turns(
+                    supcon_vectors,
+                    supcon_stances,
+                    supcon_target_ids,
+                    target_to_id,
+                    turn_vectors,
+                    turn_labels,
+                    target_str,
                 )
-
-            parts = [h_sem]
-            graph = topology_graphs[dia_id] if topology_graphs is not None else None
-
-            if self.use_topology and self.topology_encoder is not None and graph is not None:
-                topology_v = self.topology_encoder(v, graph)
-                parts.append(self.topo_norm(topology_v[-1]))
-
-            if self.use_glan_topology and self.glan_encoder is not None and graph is not None:
-                target_repr = self._extract_target_repr(out, st, ed, target_idx, dia_id)
-                _, h_glan, _, _ = self.glan_encoder(v, target_repr, graph)
-                parts.append(self.glan_norm(h_glan))
-
-            if self.use_knowledge_stance_attention and self.stance_knowledge_attn is not None:
-                if (
-                    h_favor_all is not None
-                    and h_against_all is not None
-                    and h_neutral_all is not None
-                    and dia_id < h_favor_all.size(0)
-                ):
-                    valid_mask = torch.tensor([
-                        knowledge_favor_input_masks[dia_id].sum().item() > 0,
-                        knowledge_against_input_masks[dia_id].sum().item() > 0,
-                        knowledge_neutral_input_masks[dia_id].sum().item() > 0,
-                    ], device=h_sem.device, dtype=torch.bool)
-                    if valid_mask.any():
-                        h_know, _ = self.stance_knowledge_attn(
-                            h_sem,
-                            h_favor_all[dia_id],
-                            h_against_all[dia_id],
-                            h_neutral_all[dia_id],
-                            valid_mask=valid_mask,
-                        )
-                        parts.append(h_know)
-
-            stance.append(self._concat_features(parts))
 
         logits = self.fc(torch.stack(stance))
         loss = self.criterion(logits, label)
@@ -322,10 +391,16 @@ class SITCL(nn.Module):
             and self.training
             and supcon_vectors
             and self.alllabel_supcon_lambda > 0
+            and self.supcon_proj is not None
         ):
-            vectors = torch.cat(supcon_vectors, dim=0)
-            stances = torch.cat(supcon_stances, dim=0)
-            target_ids = torch.tensor(supcon_target_ids, device=vectors.device, dtype=torch.long)
+            vectors = torch.stack(supcon_vectors, dim=0)
+            vectors = self.supcon_proj(vectors)
+            stances = torch.tensor(
+                supcon_stances, device=vectors.device, dtype=torch.long,
+            )
+            target_ids = torch.tensor(
+                supcon_target_ids, device=vectors.device, dtype=torch.long,
+            )
             cl_loss = alllabel_supcon_loss(
                 vectors,
                 stances,
