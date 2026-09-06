@@ -1,3 +1,5 @@
+import json
+import math
 import os
 import yaml
 import argparse
@@ -117,6 +119,49 @@ class Main:
         )
         print(' | '.join(parts))
 
+    def _load_target_type_map(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return {item['id']: item.get('target_type', '') for item in data}
+
+    def _macro_f1_by_target_type(self, trues, preds, doc_ids, target_type_map):
+        grouped = {'n': ([], []), 'c': ([], [])}
+        for true, pred, doc_id in zip(trues, preds, doc_ids):
+            target_type = target_type_map.get(doc_id, '')
+            if target_type not in grouped:
+                continue
+            grouped[target_type][0].append(true)
+            grouped[target_type][1].append(pred)
+        metrics = {}
+        for key in ('n', 'c'):
+            y_true, y_pred = grouped[key]
+            metrics[key] = (
+                f1_score(y_true, y_pred, average='macro')
+                if y_true else float('nan')
+            )
+        return metrics
+
+    def _format_target_type_f1(self, target_type_f1):
+        noun = target_type_f1.get('n', float('nan'))
+        claim = target_type_f1.get('c', float('nan'))
+        noun_text = 'NA' if math.isnan(noun) else f'{100 * noun:.2f}'
+        claim_text = 'NA' if math.isnan(claim) else f'{100 * claim:.2f}'
+        return (
+            f'Noun-phrase targets: {noun_text} | Claim targets: {claim_text}'
+        )
+
+    def _print_target_type_f1(self, prefix, target_type_f1):
+        print(f'{prefix} | {self._format_target_type_f1(target_type_f1)}')
+
+    def _log_target_type_f1(self, target_type_f1):
+        noun = target_type_f1.get('n', float('nan'))
+        claim = target_type_f1.get('c', float('nan'))
+        logging.info(
+            'Noun-phrase targets Macro F1: %s, Claim targets Macro F1: %s',
+            'NA' if math.isnan(noun) else f'{100 * noun:.2f}',
+            'NA' if math.isnan(claim) else f'{100 * claim:.2f}',
+        )
+
     def train_iter(self):
         self.model.train()
         running_loss = 0.0
@@ -154,11 +199,21 @@ class Main:
                 doc_id_lst.extend(data['doc_id'])
         val_loss /= len(dataLoader)
         macro_f1, favor, against, neutral, f1_avg, acc = self.get_metrices(seq_trues, seq_preds)
+        target_type_map = None
+        if mode == 'dev':
+            target_type_map = getattr(self, 'dev_target_types', None)
+        elif mode == 'test':
+            target_type_map = getattr(self, 'test_target_types', None)
+        target_type_f1 = None
+        if target_type_map is not None:
+            target_type_f1 = self._macro_f1_by_target_type(
+                seq_trues, seq_preds, doc_id_lst, target_type_map,
+            )
         if mode == 'test':
             result = {'doc_id': doc_id_lst, 'true': seq_trues, 'pred': seq_preds}
             df = pd.DataFrame(result)
             df.to_csv(self.pred_file, index=False)
-        return macro_f1, val_loss, favor, against, neutral, f1_avg, acc
+        return macro_f1, val_loss, favor, against, neutral, f1_avg, acc, target_type_f1
 
     def train(self):
         best_dev_f1 = -1.0
@@ -173,7 +228,7 @@ class Main:
             train_loss = self.train_iter()
             if hasattr(self.model, 'set_train_epoch'):
                 self.model.set_train_epoch(epoch)
-            dev_macro_f1, dev_loss, favor_f1, against_f1, neutral_f1, _, dev_acc = self.evaluate_iter(mode='dev')
+            dev_macro_f1, dev_loss, favor_f1, against_f1, neutral_f1, _, dev_acc, _ = self.evaluate_iter(mode='dev')
 
             log_msg = (
                 'Epoch %d, Train Loss: %.2f, Val Loss: %.2f, Val Macro F1: %.2f'
@@ -191,7 +246,7 @@ class Main:
                 self.best_epoch = epoch + 1
                 self.best_dev_macro_f1 = best_dev_f1
                 torch.save(self.model.state_dict(), best_ckpt)
-                test_macro_f1, test_loss, test_favor, test_against, test_neutral, _, _ = self.evaluate_iter(mode='test')
+                test_macro_f1, test_loss, test_favor, test_against, test_neutral, _, _, test_target_type_f1 = self.evaluate_iter(mode='test')
                 logging.info(
                     'Test Loss: %.2f, Test Macro F1: %.2f',
                     test_loss,
@@ -201,6 +256,12 @@ class Main:
                     f'Epoch {epoch + 1} Test (best dev)',
                     test_macro_f1, test_favor, test_against, test_neutral, loss=test_loss,
                 )
+                if test_target_type_f1 is not None:
+                    self._log_target_type_f1(test_target_type_f1)
+                    self._print_target_type_f1(
+                        f'Epoch {epoch + 1} Test (best dev) by target type',
+                        test_target_type_f1,
+                    )
             else:
                 stale_epochs += 1
 
@@ -222,7 +283,7 @@ class Main:
         if hasattr(self.model, 'set_train_epoch'):
             self.model.set_train_epoch(max(0, int(self.best_epoch) - 1))
 
-        test_macro_f1, test_loss, favor_f1, against_f1, neutral_f1, _, test_acc = self.evaluate_iter(mode='test')
+        test_macro_f1, test_loss, favor_f1, against_f1, neutral_f1, _, test_acc, test_target_type_f1 = self.evaluate_iter(mode='test')
         logging.info(
             'Test Loss: %.2f, Test Macro F1: %.2f',
             test_loss,
@@ -232,6 +293,12 @@ class Main:
             f'Final Test (best epoch {self.best_epoch})',
             test_macro_f1, favor_f1, against_f1, neutral_f1, loss=test_loss,
         )
+        if test_target_type_f1 is not None:
+            self._log_target_type_f1(test_target_type_f1)
+            self._print_target_type_f1(
+                f'Final Test (best epoch {self.best_epoch}) by target type',
+                test_target_type_f1,
+            )
 
     def load_param(self):
         param_optimizer = list(self.model.named_parameters())
@@ -299,6 +366,8 @@ class Main:
         return f1_macro, favor, against, neutral, f1_avg, accuracy
 
     def forward(self):
+        self.dev_target_types = self._load_target_type_map(self.config.dev_path)
+        self.test_target_types = self._load_target_type_map(self.config.test_path)
         self.trainLoader, self.devLoader, self.testLoader = DataProcessor(self.config).get_data()
         self.model = SITCL(self.config).to(self.config.device)
         init_checkpoint = getattr(self.config, 'init_checkpoint', None)
