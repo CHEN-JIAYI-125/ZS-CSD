@@ -18,7 +18,7 @@ adam_epsilon: 1e-8
 warmup_steps: 0
 
 # topology — context graph + optional GLAN heterograph (speaker hypergraph lives in SSE)
-use_topology: 1
+use_topology: 0
 use_glan_topology: 1
 topology_local_window: 3
 glan_dropout: 0.1
@@ -31,7 +31,7 @@ label_smoothing: 0.05
 alpha: 0  # target_CL removed from model_3; kept for v0-v2 compatibility
 
 # SSE speaker hypergraph (model_5): 1=on (default), 0=ablation (intra only)
-use_speaker_hypergraph: 0
+use_speaker_hypergraph: 1
 
 # episode hypergraph (v2 legacy; model_2 only)
 use_reply_chain_hyperedge: 1
