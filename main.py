@@ -124,7 +124,26 @@ class Main:
             data = json.load(f)
         return {item['id']: item.get('target_type', '') for item in data}
 
-    def _macro_f1_by_target_type(self, trues, preds, doc_ids, target_type_map):
+    def _subset_metrics(self, trues, preds):
+        empty = {
+            'favor': float('nan'),
+            'against': float('nan'),
+            'neutral': float('nan'),
+            'macro': float('nan'),
+            'count': 0,
+        }
+        if not trues:
+            return empty
+        macro_f1, favor, against, neutral, _, _ = self.get_metrices(trues, preds)
+        return {
+            'favor': favor,
+            'against': against,
+            'neutral': neutral,
+            'macro': macro_f1,
+            'count': len(trues),
+        }
+
+    def _metrics_by_target_groups(self, trues, preds, doc_ids, target_type_map):
         grouped = {'n': ([], []), 'c': ([], [])}
         for true, pred, doc_id in zip(trues, preds, doc_ids):
             target_type = target_type_map.get(doc_id, '')
@@ -132,35 +151,69 @@ class Main:
                 continue
             grouped[target_type][0].append(true)
             grouped[target_type][1].append(pred)
-        metrics = {}
-        for key in ('n', 'c'):
-            y_true, y_pred = grouped[key]
-            metrics[key] = (
-                f1_score(y_true, y_pred, average='macro')
-                if y_true else float('nan')
-            )
-        return metrics
+        return {
+            'mixed': self._subset_metrics(trues, preds),
+            'noun_phrase': self._subset_metrics(*grouped['n']),
+            'claim': self._subset_metrics(*grouped['c']),
+        }
 
-    def _format_target_type_f1(self, target_type_f1):
-        noun = target_type_f1.get('n', float('nan'))
-        claim = target_type_f1.get('c', float('nan'))
-        noun_text = 'NA' if math.isnan(noun) else f'{100 * noun:.2f}'
-        claim_text = 'NA' if math.isnan(claim) else f'{100 * claim:.2f}'
+    def _pct(self, value):
+        return 'NA' if value is None or math.isnan(value) else f'{100 * value:.2f}'
+
+    def _format_table2_row(self, label, metrics):
         return (
-            f'Noun-phrase targets: {noun_text} | Claim targets: {claim_text}'
+            f'{label:<20} | '
+            f'F: {self._pct(metrics["favor"]):>6} | '
+            f'A: {self._pct(metrics["against"]):>6} | '
+            f'N: {self._pct(metrics["neutral"]):>6} | '
+            f'M: {self._pct(metrics["macro"]):>6} | '
+            f'n={metrics["count"]}'
         )
 
-    def _print_target_type_f1(self, prefix, target_type_f1):
-        print(f'{prefix} | {self._format_target_type_f1(target_type_f1)}')
+    def _print_table2_metrics(self, prefix, group_metrics):
+        print(prefix)
+        print(self._format_table2_row('Noun-phrase targets', group_metrics['noun_phrase']))
+        print(self._format_table2_row('Claim targets', group_metrics['claim']))
+        print(self._format_table2_row('Mixed targets', group_metrics['mixed']))
 
-    def _log_target_type_f1(self, target_type_f1):
-        noun = target_type_f1.get('n', float('nan'))
-        claim = target_type_f1.get('c', float('nan'))
-        logging.info(
-            'Noun-phrase targets Macro F1: %s, Claim targets Macro F1: %s',
-            'NA' if math.isnan(noun) else f'{100 * noun:.2f}',
-            'NA' if math.isnan(claim) else f'{100 * claim:.2f}',
-        )
+    def _log_table2_metrics(self, prefix, group_metrics):
+        logging.info('%s (Table 2 format)', prefix)
+        for label, key in [
+            ('Noun-phrase targets', 'noun_phrase'),
+            ('Claim targets', 'claim'),
+            ('Mixed targets', 'mixed'),
+        ]:
+            m = group_metrics[key]
+            logging.info(
+                '%s | F=%s A=%s N=%s M=%s | n=%d',
+                label,
+                self._pct(m['favor']),
+                self._pct(m['against']),
+                self._pct(m['neutral']),
+                self._pct(m['macro']),
+                m['count'],
+            )
+
+    def _save_table2_metrics(self, prefix, group_metrics):
+        metrics_file = self.pred_dir + f'metrics_{self.config.seed}.txt'
+        lines = [prefix, '']
+        lines.append(f'{"Group":<20} {"F":>8} {"A":>8} {"N":>8} {"M":>8} {"Count":>8}')
+        for label, key in [
+            ('Noun-phrase', 'noun_phrase'),
+            ('Claim', 'claim'),
+            ('Mixed', 'mixed'),
+        ]:
+            m = group_metrics[key]
+            lines.append(
+                f'{label:<20} '
+                f'{self._pct(m["favor"]):>8} '
+                f'{self._pct(m["against"]):>8} '
+                f'{self._pct(m["neutral"]):>8} '
+                f'{self._pct(m["macro"]):>8} '
+                f'{m["count"]:>8}'
+            )
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
 
     def train_iter(self):
         self.model.train()
@@ -204,16 +257,16 @@ class Main:
             target_type_map = getattr(self, 'dev_target_types', None)
         elif mode == 'test':
             target_type_map = getattr(self, 'test_target_types', None)
-        target_type_f1 = None
+        target_group_metrics = None
         if target_type_map is not None:
-            target_type_f1 = self._macro_f1_by_target_type(
+            target_group_metrics = self._metrics_by_target_groups(
                 seq_trues, seq_preds, doc_id_lst, target_type_map,
             )
         if mode == 'test':
             result = {'doc_id': doc_id_lst, 'true': seq_trues, 'pred': seq_preds}
             df = pd.DataFrame(result)
             df.to_csv(self.pred_file, index=False)
-        return macro_f1, val_loss, favor, against, neutral, f1_avg, acc, target_type_f1
+        return macro_f1, val_loss, favor, against, neutral, f1_avg, acc, target_group_metrics
 
     def train(self):
         best_dev_f1 = -1.0
@@ -246,7 +299,7 @@ class Main:
                 self.best_epoch = epoch + 1
                 self.best_dev_macro_f1 = best_dev_f1
                 torch.save(self.model.state_dict(), best_ckpt)
-                test_macro_f1, test_loss, test_favor, test_against, test_neutral, _, _, test_target_type_f1 = self.evaluate_iter(mode='test')
+                test_macro_f1, test_loss, test_favor, test_against, test_neutral, _, _, test_group_metrics = self.evaluate_iter(mode='test')
                 logging.info(
                     'Test Loss: %.2f, Test Macro F1: %.2f',
                     test_loss,
@@ -256,12 +309,10 @@ class Main:
                     f'Epoch {epoch + 1} Test (best dev)',
                     test_macro_f1, test_favor, test_against, test_neutral, loss=test_loss,
                 )
-                if test_target_type_f1 is not None:
-                    self._log_target_type_f1(test_target_type_f1)
-                    self._print_target_type_f1(
-                        f'Epoch {epoch + 1} Test (best dev) by target type',
-                        test_target_type_f1,
-                    )
+                if test_group_metrics is not None:
+                    table_prefix = f'Epoch {epoch + 1} Test (best dev) — Table 2 metrics'
+                    self._log_table2_metrics(table_prefix, test_group_metrics)
+                    self._print_table2_metrics(table_prefix + ':', test_group_metrics)
             else:
                 stale_epochs += 1
 
@@ -283,7 +334,7 @@ class Main:
         if hasattr(self.model, 'set_train_epoch'):
             self.model.set_train_epoch(max(0, int(self.best_epoch) - 1))
 
-        test_macro_f1, test_loss, favor_f1, against_f1, neutral_f1, _, test_acc, test_target_type_f1 = self.evaluate_iter(mode='test')
+        test_macro_f1, test_loss, favor_f1, against_f1, neutral_f1, _, test_acc, test_group_metrics = self.evaluate_iter(mode='test')
         logging.info(
             'Test Loss: %.2f, Test Macro F1: %.2f',
             test_loss,
@@ -293,12 +344,11 @@ class Main:
             f'Final Test (best epoch {self.best_epoch})',
             test_macro_f1, favor_f1, against_f1, neutral_f1, loss=test_loss,
         )
-        if test_target_type_f1 is not None:
-            self._log_target_type_f1(test_target_type_f1)
-            self._print_target_type_f1(
-                f'Final Test (best epoch {self.best_epoch}) by target type',
-                test_target_type_f1,
-            )
+        if test_group_metrics is not None:
+            table_prefix = f'Final Test (best epoch {self.best_epoch}) — Table 2 metrics'
+            self._log_table2_metrics(table_prefix, test_group_metrics)
+            self._print_table2_metrics(table_prefix + ':', test_group_metrics)
+            self._save_table2_metrics(table_prefix, test_group_metrics)
 
     def load_param(self):
         param_optimizer = list(self.model.named_parameters())
