@@ -65,22 +65,22 @@ knowledge_stance_only: 1  # load description as neutral side for stance attentio
 use_knowledge_stance_attention: 0  # attend h_sem to favor/against/neutral, concat to classifier
 knowledge_dropout: 0.1
 
-# Experiment B (model_4): last-turn aligned SupCon — no inference change
+# Experiment B (model_4): last-turn stance SupCon (standard SupCon, no target split)
 # use_alllabel_supcon: 1
-# alllabel_supcon_last_turn_only: 1   # 1=last turn fused (same as fc); 0=legacy all-turn
-# alllabel_supcon_lambda: 0.02
+# alllabel_supcon_last_turn_only: 1
+# alllabel_supcon_lambda: 0.01        # try 0.005 / 0.01 / 0.02
 # alllabel_supcon_tau: 0.10
+# alllabel_supcon_warmup_epochs: 2    # CE-only for first N epochs
 # alllabel_supcon_proj_dim: 256
-# cross_target_positive_weight: 0     # 0=same-target same-stance positives only
 # Switch src/model/__init__.py to model_4 for Exp B.
 
 # Experiment C (model_5): SupCon + PPED evidence distillation
 use_alllabel_supcon: 0
 alllabel_supcon_last_turn_only: 1
-alllabel_supcon_lambda: 0.02
+alllabel_supcon_lambda: 0.01
 alllabel_supcon_tau: 0.10
+alllabel_supcon_warmup_epochs: 2
 alllabel_supcon_proj_dim: 256
-cross_target_positive_weight: 0
 use_pped_evidence: 0
 use_latent_reply: 0
 use_reply_posterior: 0

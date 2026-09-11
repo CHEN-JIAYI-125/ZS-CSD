@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel
 
-from src.common import alllabel_supcon_loss, map_sequence
+from src.common import stance_supcon_loss, map_sequence
 from src.topology.topology_4 import (
     ContextTopologyEncoder,
     SpeakerHypergraphChannel,
@@ -38,19 +38,26 @@ class Attention(nn.Module):
 
 
 class SSE(nn.Module):
-    """Speaker-aware encoding: intra dialogue attention + speaker hypergraph inter."""
+    """Speaker-aware encoding: intra dialogue attention + optional speaker hypergraph inter."""
 
-    def __init__(self, hidden_dim=768, dropout=0.2):
+    def __init__(self, hidden_dim=768, dropout=0.2, use_speaker_hypergraph=True):
         super().__init__()
+        self.use_speaker_hypergraph = use_speaker_hypergraph
         self.linear_intra = nn.Linear(hidden_dim * 2, hidden_dim)
         self.attention_intra = Attention(hidden_dim)
-        self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
+        if use_speaker_hypergraph:
+            self.speaker_hypergraph = SpeakerHypergraphChannel(hidden_dim, dropout=dropout)
+        else:
+            self.speaker_hypergraph = None
 
     def forward(self, utterances, speakers):
         device = utterances.device
         speakers_mapped = map_sequence(speakers)
         speaker_ids = torch.tensor(speakers_mapped, device=device)
-        inter_all = self.speaker_hypergraph(utterances, speaker_ids)
+        if self.use_speaker_hypergraph and self.speaker_hypergraph is not None:
+            inter_all = self.speaker_hypergraph(utterances, speaker_ids)
+        else:
+            inter_all = None
 
         v_lst = []
         last_speaker_idx = {}
@@ -64,7 +71,10 @@ class SSE(nn.Module):
                 q_intra = self.linear_intra(vh_concat)
                 context = utterances[: i + 1]
                 v_intra = self.attention_intra(q_intra, context, context)
-                v_lst.append(v_intra + inter_all[i])
+                if inter_all is not None:
+                    v_lst.append(v_intra + inter_all[i])
+                else:
+                    v_lst.append(v_intra)
             last_speaker_idx[speaker_id] = i
         return torch.stack(v_lst)
 
@@ -96,7 +106,7 @@ class StanceKnowledgeAttention(nn.Module):
 
 
 class SITCL(nn.Module):
-    """Experiment B: v3-identical inference + last-turn aligned SupCon (train only, epoch 1+)."""
+    """Experiment B: model_5-aligned backbone + last-turn stance SupCon (train only)."""
 
     def __init__(self, config):
         super().__init__()
@@ -111,9 +121,13 @@ class SITCL(nn.Module):
         self.alllabel_supcon_last_turn_only = bool(
             getattr(config, 'alllabel_supcon_last_turn_only', 1)
         )
-        self.alllabel_supcon_lambda = float(getattr(config, 'alllabel_supcon_lambda', 0.05))
-        self.alllabel_supcon_tau = float(getattr(config, 'alllabel_supcon_tau', 0.07))
-        self.cross_target_positive_weight = float(getattr(config, 'cross_target_positive_weight', 0.0))
+        self.alllabel_supcon_lambda = float(getattr(config, 'alllabel_supcon_lambda', 0.01))
+        self.alllabel_supcon_tau = float(getattr(config, 'alllabel_supcon_tau', 0.10))
+        self.alllabel_supcon_warmup_epochs = int(
+            getattr(config, 'alllabel_supcon_warmup_epochs', 2)
+        )
+        self.use_speaker_hypergraph = bool(getattr(config, 'use_speaker_hypergraph', 1))
+        self.train_epoch = 0
 
         hidden = config.gru_hidden
         self.bert = AutoModel.from_pretrained(config.bert_dir)
@@ -124,8 +138,13 @@ class SITCL(nn.Module):
         self.criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=label_smoothing)
 
         dropout = float(getattr(config, 'sse_dropout', 0.2))
-        self.SSE = SSE(hidden_dim=hidden, dropout=dropout)
+        self.SSE = SSE(
+            hidden_dim=hidden,
+            dropout=dropout,
+            use_speaker_hypergraph=self.use_speaker_hypergraph,
+        )
         self.sem_norm = nn.LayerNorm(hidden)
+        self.target_proj = nn.Linear(768, hidden)
 
         fusion_dim = hidden
         if self.use_topology:
@@ -173,18 +192,27 @@ class SITCL(nn.Module):
         if self.use_alllabel_supcon:
             supcon_mode = 'last_turn' if self.alllabel_supcon_last_turn_only else 'all_turn'
         logging.info(
-            'model_4 init: context=%s glan=%s knowledge=%s alllabel_supcon=%s mode=%s '
-            'lambda=%.3f tau=%.3f cross_target_w=%.2f (fusion_dim=%d, epoch 1+)',
+            'model_4 init: context=%s glan=%s knowledge=%s speaker_hypergraph=%s '
+            'stance_supcon=%s mode=%s lambda=%.3f tau=%.3f warmup_epochs=%d (fusion_dim=%d)',
             self.use_topology,
             self.use_glan_topology,
             self.use_knowledge_stance_attention,
+            self.use_speaker_hypergraph,
             self.use_alllabel_supcon,
             supcon_mode,
             self.alllabel_supcon_lambda,
             self.alllabel_supcon_tau,
-            self.cross_target_positive_weight,
+            self.alllabel_supcon_warmup_epochs,
             fusion_dim,
         )
+
+    def set_train_epoch(self, epoch):
+        self.train_epoch = int(epoch)
+
+    def _stance_supcon_active(self):
+        if not self.use_alllabel_supcon:
+            return False
+        return (self.train_epoch + 1) > self.alllabel_supcon_warmup_epochs
 
     def _build_class_weights(self, config):
         if not bool(getattr(config, 'use_class_weight', 0)):
@@ -271,23 +299,10 @@ class SITCL(nn.Module):
             parts.append(h_know if h_know is not None else torch.zeros_like(h_sem_turn))
         return self._concat_features(parts)
 
-    def _collect_supcon_turns(
-        self,
-        supcon_vectors,
-        supcon_stances,
-        supcon_target_ids,
-        target_to_id,
-        turn_vectors,
-        turn_labels,
-        target_str,
-    ):
-        if target_str not in target_to_id:
-            target_to_id[target_str] = len(target_to_id)
-        tid = target_to_id[target_str]
+    def _collect_supcon_turns(self, supcon_vectors, supcon_stances, turn_vectors, turn_labels):
         for turn_id, turn_vec in enumerate(turn_vectors):
             supcon_vectors.append(turn_vec)
             supcon_stances.append(int(turn_labels[turn_id].item()))
-            supcon_target_ids.append(tid)
 
     def forward(self, **kwargs):
         input_ids = kwargs['input_ids']
@@ -327,8 +342,6 @@ class SITCL(nn.Module):
         stance = []
         supcon_vectors = []
         supcon_stances = []
-        supcon_target_ids = []
-        target_to_id = {}
 
         for dia_id, (st, ed) in enumerate(dia_idx):
             h = self._extract_utterance_hidden(out, st, ed, mask_positions, dia_id)
@@ -342,7 +355,9 @@ class SITCL(nn.Module):
 
             h_glan = None
             if self.use_glan_topology and self.glan_encoder is not None and graph is not None:
-                target_repr = self._extract_target_repr(out, st, ed, target_idx, dia_id)
+                target_repr = self.target_proj(
+                    self._extract_target_repr(out, st, ed, target_idx, dia_id),
+                )
                 _, h_glan, _, _ = self.glan_encoder(v, target_repr, graph)
 
             h_sem = self.sem_norm(v[-1])
@@ -361,12 +376,7 @@ class SITCL(nn.Module):
             )
             stance.append(fused_last)
 
-            if self.use_alllabel_supcon and self.training:
-                target_str = str(targets[dia_id]) if dia_id < len(targets) else str(dia_id)
-                if target_str not in target_to_id:
-                    target_to_id[target_str] = len(target_to_id)
-                tid = target_to_id[target_str]
-
+            if self.use_alllabel_supcon and self.training and self._stance_supcon_active():
                 if self.alllabel_supcon_last_turn_only:
                     final_label = label[dia_id]
                     if torch.is_tensor(final_label):
@@ -375,7 +385,6 @@ class SITCL(nn.Module):
                         final_label = int(final_label)
                     supcon_vectors.append(fused_last)
                     supcon_stances.append(final_label)
-                    supcon_target_ids.append(tid)
                 elif all_label is not None:
                     turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
                     turn_vectors = []
@@ -399,11 +408,8 @@ class SITCL(nn.Module):
                     self._collect_supcon_turns(
                         supcon_vectors,
                         supcon_stances,
-                        supcon_target_ids,
-                        target_to_id,
                         turn_vectors,
                         turn_labels,
-                        target_str,
                     )
 
         logits = self.fc(torch.stack(stance))
@@ -412,6 +418,7 @@ class SITCL(nn.Module):
         if (
             self.use_alllabel_supcon
             and self.training
+            and self._stance_supcon_active()
             and supcon_vectors
             and self.alllabel_supcon_lambda > 0
             and self.supcon_proj is not None
@@ -421,15 +428,10 @@ class SITCL(nn.Module):
             stances = torch.tensor(
                 supcon_stances, device=vectors.device, dtype=torch.long,
             )
-            target_ids = torch.tensor(
-                supcon_target_ids, device=vectors.device, dtype=torch.long,
-            )
-            cl_loss = alllabel_supcon_loss(
+            cl_loss = stance_supcon_loss(
                 vectors,
                 stances,
-                target_ids,
                 tau=self.alllabel_supcon_tau,
-                cross_target_weight=self.cross_target_positive_weight,
             )
             if torch.isfinite(cl_loss):
                 loss = loss + self.alllabel_supcon_lambda * cl_loss

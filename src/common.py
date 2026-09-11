@@ -72,10 +72,48 @@ def target_CL(H_lst, target, config):
     return loss
 
 
+def stance_supcon_loss(vectors, stance_labels, tau=0.1):
+    """
+    Standard supervised contrastive loss: same stance = positive (any target).
+    Uses mean log-probability over all positives per anchor (Khosla et al. SupCon).
+    """
+    if vectors.size(0) <= 1:
+        return vectors.new_zeros(())
+
+    z = F.normalize(vectors, p=2, dim=-1)
+    logits = torch.mm(z, z.t()) / max(float(tau), 1e-4)
+
+    num = z.size(0)
+    eye = torch.eye(num, device=z.device, dtype=torch.bool)
+
+    logits = logits.masked_fill(eye, float('-inf'))
+
+    log_denom = torch.logsumexp(logits, dim=1, keepdim=True)
+    log_prob = logits - log_denom
+
+    pos_mask = (
+        stance_labels.unsqueeze(0) == stance_labels.unsqueeze(1)
+    ) & ~eye
+
+    pos_count = pos_mask.sum(dim=1)
+    valid = pos_count > 0
+
+    if not valid.any():
+        return vectors.new_zeros(())
+
+    loss_i = -(
+        log_prob.masked_fill(~pos_mask, 0.0).sum(dim=1)
+        / pos_count.clamp_min(1)
+    )
+
+    return loss_i[valid].mean()
+
+
 def alllabel_supcon_loss(vectors, stance_labels, target_ids, tau=0.07, cross_target_weight=0.5):
     """
-    PPED-style SupCon over all utterances in a batch.
-    Positive: same stance; weight 1.0 if same target else cross_target_weight.
+    Legacy PPED-style SupCon with optional cross-target weighting.
+    Prefer stance_supcon_loss for model_4; cross_target_weight=0 can treat
+    cross-target same-stance pairs as implicit negatives in the denominator.
     """
     if vectors.size(0) <= 1:
         return vectors.new_zeros(())
