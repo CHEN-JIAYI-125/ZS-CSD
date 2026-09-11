@@ -96,7 +96,7 @@ class StanceKnowledgeAttention(nn.Module):
 
 
 class SITCL(nn.Module):
-    """Experiment B: v3-identical inference + all_label SupCon on fused turn features (train only, epoch 1+)."""
+    """Experiment B: v3-identical inference + last-turn aligned SupCon (train only, epoch 1+)."""
 
     def __init__(self, config):
         super().__init__()
@@ -108,9 +108,12 @@ class SITCL(nn.Module):
             or getattr(config, 'use_knowledge_gate', 0)
         )
         self.use_alllabel_supcon = bool(getattr(config, 'use_alllabel_supcon', 0))
+        self.alllabel_supcon_last_turn_only = bool(
+            getattr(config, 'alllabel_supcon_last_turn_only', 1)
+        )
         self.alllabel_supcon_lambda = float(getattr(config, 'alllabel_supcon_lambda', 0.05))
         self.alllabel_supcon_tau = float(getattr(config, 'alllabel_supcon_tau', 0.07))
-        self.cross_target_positive_weight = float(getattr(config, 'cross_target_positive_weight', 0.5))
+        self.cross_target_positive_weight = float(getattr(config, 'cross_target_positive_weight', 0.0))
 
         hidden = config.gru_hidden
         self.bert = AutoModel.from_pretrained(config.bert_dir)
@@ -166,15 +169,20 @@ class SITCL(nn.Module):
             )
         else:
             self.supcon_proj = None
+        supcon_mode = 'off'
+        if self.use_alllabel_supcon:
+            supcon_mode = 'last_turn' if self.alllabel_supcon_last_turn_only else 'all_turn'
         logging.info(
-            'model_4 init: context=%s glan=%s knowledge=%s alllabel_supcon=%s '
-            'lambda=%.3f tau=%.3f (fusion_dim=%d, supcon_from_epoch=1)',
+            'model_4 init: context=%s glan=%s knowledge=%s alllabel_supcon=%s mode=%s '
+            'lambda=%.3f tau=%.3f cross_target_w=%.2f (fusion_dim=%d, epoch 1+)',
             self.use_topology,
             self.use_glan_topology,
             self.use_knowledge_stance_attention,
             self.use_alllabel_supcon,
+            supcon_mode,
             self.alllabel_supcon_lambda,
             self.alllabel_supcon_tau,
+            self.cross_target_positive_weight,
             fusion_dim,
         )
 
@@ -348,40 +356,55 @@ class SITCL(nn.Module):
                 knowledge_against_input_masks,
                 knowledge_neutral_input_masks,
             )
-            stance.append(
-                self._fused_turn_vector(h_sem, topology_v, v.size(0) - 1, h_glan, h_know_last),
+            fused_last = self._fused_turn_vector(
+                h_sem, topology_v, v.size(0) - 1, h_glan, h_know_last,
             )
+            stance.append(fused_last)
 
-            if self.use_alllabel_supcon and self.training and all_label is not None:
-                turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
+            if self.use_alllabel_supcon and self.training:
                 target_str = str(targets[dia_id]) if dia_id < len(targets) else str(dia_id)
-                turn_vectors = []
-                for turn_id in range(v.size(0)):
-                    h_sem_turn = self.sem_norm(v[turn_id])
-                    h_know_turn = self._knowledge_vector(
-                        h_sem_turn,
-                        dia_id,
-                        h_favor_all,
-                        h_against_all,
-                        h_neutral_all,
-                        knowledge_favor_input_masks,
-                        knowledge_against_input_masks,
-                        knowledge_neutral_input_masks,
+                if target_str not in target_to_id:
+                    target_to_id[target_str] = len(target_to_id)
+                tid = target_to_id[target_str]
+
+                if self.alllabel_supcon_last_turn_only:
+                    final_label = label[dia_id]
+                    if torch.is_tensor(final_label):
+                        final_label = int(final_label.item())
+                    else:
+                        final_label = int(final_label)
+                    supcon_vectors.append(fused_last)
+                    supcon_stances.append(final_label)
+                    supcon_target_ids.append(tid)
+                elif all_label is not None:
+                    turn_labels = self._all_labels_tensor(all_label, dia_id, v.size(0), v.device)
+                    turn_vectors = []
+                    for turn_id in range(v.size(0)):
+                        h_sem_turn = self.sem_norm(v[turn_id])
+                        h_know_turn = self._knowledge_vector(
+                            h_sem_turn,
+                            dia_id,
+                            h_favor_all,
+                            h_against_all,
+                            h_neutral_all,
+                            knowledge_favor_input_masks,
+                            knowledge_against_input_masks,
+                            knowledge_neutral_input_masks,
+                        )
+                        turn_vectors.append(
+                            self._fused_turn_vector(
+                                h_sem_turn, topology_v, turn_id, h_glan, h_know_turn,
+                            ),
+                        )
+                    self._collect_supcon_turns(
+                        supcon_vectors,
+                        supcon_stances,
+                        supcon_target_ids,
+                        target_to_id,
+                        turn_vectors,
+                        turn_labels,
+                        target_str,
                     )
-                    turn_vectors.append(
-                        self._fused_turn_vector(
-                            h_sem_turn, topology_v, turn_id, h_glan, h_know_turn,
-                        ),
-                    )
-                self._collect_supcon_turns(
-                    supcon_vectors,
-                    supcon_stances,
-                    supcon_target_ids,
-                    target_to_id,
-                    turn_vectors,
-                    turn_labels,
-                    target_str,
-                )
 
         logits = self.fc(torch.stack(stance))
         loss = self.criterion(logits, label)
